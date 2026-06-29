@@ -1,5 +1,7 @@
 # git-private2public
 
+[![PyPI version](https://img.shields.io/pypi/v/git-private2public.svg)](https://pypi.org/project/git-private2public/) [![CI](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml/badge.svg)](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml)
+
 **[English](./README.md)** · **[Русский](./README.ru.md)**
 
 ---
