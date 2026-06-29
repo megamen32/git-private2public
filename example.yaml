@@ -1,6 +1,7 @@
 # git-private2public config
 # Easy mode: just list files to NOT publish. Like .gitignore.
 
+# owner/repo shorthand, full Git URL, or local path
 source: owner/private-repo
 target: owner/public-repo
 

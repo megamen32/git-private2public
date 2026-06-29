@@ -12,11 +12,11 @@
 ## Быстрый старт
 
 ```bash
-pip install git-filter-repo pyyaml
+pip install git-private2public
 git-private2public init          # создаёт папку .gitpublic/
 ```
 
-Отредактируй `.gitpublic/config` — source и target:
+Отредактируй `.gitpublic/config` — source и target. Значения могут быть `owner/repo`, полный Git URL или локальный путь:
 
 ```
 source = you/private-repo
@@ -60,7 +60,7 @@ git-private2public hook disable    # выкл
 | `ignore` | что НЕ публиковать | путь/маска на строку |
 | `replace` | найти → заменить в файлах | `old ==> new` на строку |
 | `scan` | отказаться пушить если найдёт | паттерн на строку |
-| `allow` | домены которые ОК | по одному на строку |
+| `allow` | домены, которые ОК при совпадении `scan` рядом | по одному домену в строке |
 
 **Простой** — редактируй только `ignore`:
 
@@ -84,18 +84,44 @@ regex:[A-Fa-f0-9]{64} ==> ***
 # scan:
 regex:github_pat_[A-Za-z0-9_]{30,}
 regex:192\.168\.
+regex:[a-z0-9.-]+\.[a-z]{2,}
 
 # allow:
+github.com
 get.docker.com
 ```
 
 ## Команды
 
 ```
-init        создать конфиг
-scan        проверить, не пушить
+init        создать .gitpublic/ конфиг
+scan        почистить во временный репозиторий, проверить, не пушить
 publish     вычистить + запушить
 hook        enable / disable / status
+```
+
+## Как работает `allow` / domains
+
+`allow` — это не замена текста. Это allowlist для этапа сканирования.
+
+Пример: добавь широкий детектор доменов в `.gitpublic/scan`:
+
+```
+regex:[a-z0-9.-]+\.[a-z]{2,}
+```
+
+Теперь любой похожий на домен текст валит scan, кроме случаев, когда сам найденный домен есть в `.gitpublic/allow`:
+
+```
+github.com
+get.docker.com
+```
+
+Для переписывания приватных доменов используй `.gitpublic/replace`:
+
+```
+private.company.local ==> example.com
+regex:.*\.corp\.internal ==> example.com
 ```
 
 ## Установка

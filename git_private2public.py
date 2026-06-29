@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+__version__ = "0.1.1"
+
 try:
     import yaml
 except ImportError:
@@ -62,7 +64,7 @@ class Config:
             target=data["target"],
             delete=list(data.get("delete") or data.get("ignore") or []),
             replace=list(data.get("replace") or []),
-            allow_domains=list(data.get("allow_domains") or []),
+            allow_domains=list(data.get("allow_domains") or data.get("allow") or data.get("domains") or []),
             fail_on_match=list(data.get("fail_on_match") or []),
             push_force=push.get("force", True),
             push_branches=list(push.get("branches") or ["main"]),
@@ -122,7 +124,7 @@ class Config:
             target=target,
             delete=read_lines("ignore"),
             replace=read_lines("replace"),
-            allow_domains=read_lines("allow"),
+            allow_domains=read_lines("allow") + read_lines("domains"),
             fail_on_match=read_lines("scan"),
             push_force=push_force,
             push_branches=push_branches,
@@ -194,7 +196,7 @@ class ReplaceRule:
             colon = rest.find(":")
             if colon == -1:
                 raise ValueError(f"bad glob rule: {raw}")
-            file_glob = rest[:colon]
+            file_glob = rest[:colon].strip()
             s = rest[colon + 1:]
 
         sep = "==>"
@@ -202,8 +204,8 @@ class ReplaceRule:
         if idx == -1:
             raise ValueError(f"replace rule missing '==>': {raw}")
         return cls(
-            pattern=s[:idx],
-            replacement=s[idx + len(sep):],
+            pattern=s[:idx].strip(),
+            replacement=s[idx + len(sep):].strip(),
             is_regex=is_regex,
             file_glob=file_glob,
         )
@@ -219,6 +221,38 @@ def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subproces
     return subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True)
 
 
+def expand_github_shorthand(value: str) -> str:
+    """Expand owner/repo to a GitHub HTTPS clone/push URL.
+
+    Full URLs and local paths are returned unchanged. This keeps `.gitpublic/config`
+    short while still allowing SSH URLs or local test repositories.
+    """
+    value = value.strip()
+    if not value:
+        return value
+    if value.startswith(("http://", "https://", "git@", "ssh://", "file://")):
+        return value
+    if value.startswith((".", "/", "~")):
+        return value
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
+        return f"https://github.com/{value}.git"
+    return value
+
+
+def mask_url(url: str) -> str:
+    return re.sub(r"https://[^/@]+@", "https://***@", url)
+
+
+def validate_config(config: Config) -> None:
+    missing = []
+    if not config.source:
+        missing.append("source")
+    if not config.target:
+        missing.append("target")
+    if missing:
+        raise SystemExit(f"missing required config value(s): {', '.join(missing)}")
+
+
 def clone_source(source: str, dest: Path) -> None:
     """Clone the source repo (full history, all branches)."""
     run(["git", "clone", "--mirror", source, str(dest)])
@@ -228,11 +262,14 @@ def clone_source(source: str, dest: Path) -> None:
 
 def make_filter_repo_args(deletes: list[DeleteRule], replaces_path: Path) -> list[str]:
     args: list[str] = []
+    for d in deletes:
+        if d.is_glob:
+            args.extend(["--path-glob", d.pattern])
+        else:
+            # Keep trailing slash for directories; git-filter-repo treats it as a path prefix.
+            args.extend(["--path", d.pattern])
     if deletes:
-        # filter-repo --invert-paths --path ... --path ...
         args.append("--invert-paths")
-        for d in deletes:
-            args.extend(["--path", d.pattern.rstrip("/")])
     if replaces_path.exists():
         args.extend(["--replace-text", str(replaces_path)])
     return args
@@ -249,7 +286,7 @@ def write_replace_file(path: Path, rules: list[ReplaceRule]) -> None:
         elif r.file_glob:
             prefix = f"glob:{r.file_glob}:"
         else:
-            prefix = ""
+            prefix = "literal:"
         lines.append(f"{prefix}{r.pattern}==>{r.replacement}")
     path.write_text("\n".join(lines) + "\n")
 
@@ -261,7 +298,7 @@ def write_replace_file(path: Path, rules: list[ReplaceRule]) -> None:
 def scan_tree(repo: Path, config: Config) -> list[str]:
     """Return list of violations (pattern + file:line) in the current tree."""
     violations: list[str] = []
-    allow_re = re.compile("|".join(re.escape(d) for d in config.allow_domains)) if config.allow_domains else None
+    allow_re = re.compile(b"|".join(re.escape(d.encode()) for d in config.allow_domains)) if config.allow_domains else None
 
     # Compile fail_on_match patterns
     compiled: list[tuple[str, re.Pattern]] = []
@@ -286,9 +323,11 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
             continue
         for raw, pat in compiled:
             for m in pat.finditer(data):
-                # Check if it's inside an allowlisted domain context
-                ctx = data[max(0, m.start() - 30):m.end() + 30]
-                if allow_re and allow_re.search(ctx):
+                # Domain allowlist applies to the matched text itself.
+                # Using surrounding context would accidentally allow `private.local`
+                # just because `github.com` appears nearby on the same line/paragraph.
+                matched = m.group(0)
+                if allow_re and allow_re.search(matched):
                     continue
                 # Find line number
                 line = data[:m.start()].count(b"\n") + 1
@@ -302,6 +341,7 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 def publish(config: Config, scan_only: bool = False) -> int:
+    validate_config(config)
     deletes = [DeleteRule.parse(d) for d in config.delete]
     replaces = [ReplaceRule.parse(r) for r in config.replace]
 
@@ -309,8 +349,9 @@ def publish(config: Config, scan_only: bool = False) -> int:
         tmp_path = Path(tmp)
         work = tmp_path / "work"
 
-        print(f"▸ Cloning {config.source} ...", file=sys.stderr)
-        run(["git", "clone", "--no-local", config.source, str(work)])
+        source_url = expand_github_shorthand(config.source)
+        print(f"▸ Cloning {mask_url(source_url)} ...", file=sys.stderr)
+        run(["git", "clone", "--no-local", source_url, str(work)])
 
         # Detach origin (filter-repo removes it anyway)
         run(["git", "remote", "remove", "origin"], cwd=str(work), check=False)
@@ -354,24 +395,21 @@ def publish(config: Config, scan_only: bool = False) -> int:
             return 0
 
         # Push to target
-        target_url = config.target
-        # If target is "owner/repo" shorthand, expand to GitHub HTTPS
-        if "/" in target_url and not target_url.startswith(("http", "git@", "ssh://")):
-            target_url = f"https://github.com/{target_url}.git"
+        target_url = expand_github_shorthand(config.target)
 
-        # Auth from env if provided
+        # Auth from env if provided. Never print the tokenized URL.
         token = os.environ.get("GIT_PRIVATE2PUBLIC_TOKEN")
-        if token and "github.com" in target_url:
-            target_url = target_url.replace("https://", f"https://x-access-token:{token}@")
+        if token and "github.com" in target_url and target_url.startswith("https://"):
+            target_url = target_url.replace("https://", f"https://x-access-token:{token}@", 1)
 
-        print(f"▸ Pushing to {target_url} ...", file=sys.stderr)
+        print(f"▸ Pushing to {mask_url(target_url)} ...", file=sys.stderr)
         run(["git", "remote", "add", "target", target_url], cwd=str(work))
 
         for branch in config.push_branches:
             push_cmd = ["git", "push"]
             if config.push_force:
-                push_cmd.append("--force")
-            push_cmd.extend(["target", branch])
+                push_cmd.append("--force-with-lease")
+            push_cmd.extend(["target", f"HEAD:{branch}"])
             res = subprocess.run(push_cmd, cwd=str(work), capture_output=True, text=True)
             if res.returncode != 0:
                 sys.stderr.write(res.stderr)
@@ -433,6 +471,8 @@ def cmd_hook(args) -> int:
 
     if args.action == "enable":
         hook_dir.mkdir(parents=True, exist_ok=True)
+        if hook_path.exists() and marker not in hook_path.read_text():
+            sys.exit(f"{hook_path} exists and is not managed by git-private2public; refusing to overwrite")
         # Resolve path to this tool + config
         tool = str(Path(__file__).resolve())
         cfg = str(Path(args.config).resolve())
@@ -493,6 +533,7 @@ def find_git_root(start: Path) -> Path | None:
 # Files written by `init` into .gitpublic/
 GITPUBLIC_FILES = {
     "config": """# Required: which repos to sync
+# owner/repo shorthand, full Git URL, or local path
 source = you/private-repo
 target = you/public-repo
 
@@ -517,7 +558,8 @@ secrets/
 # regex:sk-[A-Za-z0-9]{40,}
 # regex:192\\.168\\.
 """,
-    "allow": """# Domains that are OK to publish (won't trigger scan).
+    "allow": """# Domains that are OK to publish when the matched text is that domain.
+# Example: scan has regex:[a-z0-9.-]+\\.[a-z]{2,}; allow keeps public domains from failing.
 # get.docker.com
 # example.com
 """,
@@ -566,6 +608,7 @@ def main() -> int:
         prog="git-private2public",
         description="Like .gitignore, but for what goes public. Folder-based config.",
     )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_init = sub.add_parser("init", help="write an example config")

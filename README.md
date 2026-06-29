@@ -12,11 +12,11 @@ tool keeps them in sync. Automatically.
 ## Quick start
 
 ```bash
-pip install git-filter-repo pyyaml
+pip install git-private2public
 git-private2public init          # creates .gitpublic/ folder
 ```
 
-Edit `.gitpublic/config` — set source + target:
+Edit `.gitpublic/config` — set source + target. Values can be `owner/repo`, a full Git URL, or a local path:
 
 ```
 source = you/private-repo
@@ -60,7 +60,7 @@ comments. If a file is missing, that setting is just empty.
 | `ignore` | files to NOT publish | one path/glob per line |
 | `replace` | find → replace in file contents | `old ==> new` per line |
 | `scan` | refuse to push if matched | one pattern per line |
-| `allow` | domains OK to publish | one per line |
+| `allow` | domains OK to publish when scan matches nearby text | one domain per line |
 
 **Easy** — just edit `ignore`:
 
@@ -84,18 +84,44 @@ regex:[A-Fa-f0-9]{64} ==> ***
 # scan:
 regex:github_pat_[A-Za-z0-9_]{30,}
 regex:192\.168\.
+regex:[a-z0-9.-]+\.[a-z]{2,}
 
 # allow:
+github.com
 get.docker.com
 ```
 
 ## Commands
 
 ```
-init        create config
-scan        check, don't push
+init        create .gitpublic/ config
+scan        clean into a temp repo, scan, don't push
 publish     clean + push
 hook        enable / disable / status
+```
+
+## How `allow` / domains work
+
+`allow` is not a replacement rule. It is an allowlist used during scanning.
+
+Example: put a broad domain detector into `.gitpublic/scan`:
+
+```
+regex:[a-z0-9.-]+\.[a-z]{2,}
+```
+
+Now every domain-like string fails the scan unless the matched domain is listed in `.gitpublic/allow`:
+
+```
+github.com
+get.docker.com
+```
+
+Use `.gitpublic/replace` to rewrite private domains, for example:
+
+```
+private.company.local ==> example.com
+regex:.*\.corp\.internal ==> example.com
 ```
 
 ## Install

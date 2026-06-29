@@ -1,6 +1,6 @@
 [project]
 name = "git-private2public"
-version = "0.1.0"
+version = "0.1.1"
 description = "Like .gitignore, but for what goes public. Keep a sanitized public mirror of your private repo."
 readme = "README.md"
 license = {text = "MIT"}
@@ -35,3 +35,8 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 # Single-file module — include the .py at root
 only-include = ["git_private2public.py"]
+
+[project.urls]
+Homepage = "https://github.com/megamen32/git-private2public"
+Repository = "https://github.com/megamen32/git-private2public"
+Issues = "https://github.com/megamen32/git-private2public/issues"

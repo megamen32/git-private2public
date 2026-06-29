@@ -30,14 +30,14 @@ jobs:
 
       - name: Install git-private2public
         run: |
-          curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git-private2public.py \
+          curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git_private2public.py \
             -o git-private2public && chmod +x git-private2public
 
       - name: Scan (no push) — see what would change
-        run: ./git-private2public scan -c .git-private2public.yaml
+        run: ./git-private2public scan -c .gitpublic
 
       - name: Publish to public repo
-        run: ./git-private2public publish -c .git-private2public.yaml
+        run: ./git-private2public publish -c .gitpublic
         env:
           GIT_PRIVATE2PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
 
