@@ -13,19 +13,22 @@
 
 ```bash
 pip install git-filter-repo pyyaml
-git-private2public init          # создаёт .git-private2public.yaml
+git-private2public init          # создаёт папку .gitpublic/
 ```
 
-Отредактируй конфиг — что прятать:
+Отредактируй `.gitpublic/config` — source и target:
 
-```yaml
-source: you/private-repo
-target: you/public-repo
+```
+source = you/private-repo
+target = you/public-repo
+```
 
-ignore:
-  - ".env"
-  - "secrets/"
-  - "*.key"
+Отредактируй `.gitpublic/ignore` — что прятать, по строке (как `.gitignore`):
+
+```
+.env
+secrets/
+*.key
 ```
 
 Опубликуй:
@@ -46,28 +49,44 @@ git-private2public hook disable    # выкл
 
 Нативный git-хук. Без CI, без GitHub Actions. Работает офлайн.
 
-## Режимы
+## Папка `.gitpublic/`
 
-**Простой** — просто игнорировать файлы (пример выше).
+Каждый файл — одна забота. Как `.gitignore` — одно правило на строку, `#` для
+комментариев. Если файла нет — настройки просто нет.
 
-**Средний** — ещё вычищать секреты внутри файлов:
+| Файл | Что внутри | Формат |
+|------|------------|--------|
+| `config` | source, target, push | `key = value` |
+| `ignore` | что НЕ публиковать | путь/маска на строку |
+| `replace` | найти → заменить в файлах | `old ==> new` на строку |
+| `scan` | отказаться пушить если найдёт | паттерн на строку |
+| `allow` | домены которые ОК | по одному на строку |
 
-```yaml
-replace:
-  - "10.0.0.5==>203.0.113.5"
-  - "real-token==>***"
+**Простой** — редактируй только `ignore`:
+
+```
+.env
+secrets/
+*.key
 ```
 
-**Сложный** — регулярки, скан, отказаться пушить если что-то выжило:
+**Средний** — ещё `replace`:
 
-```yaml
-replace:
-  - "regex:[A-Fa-f0-9]{64}==>***"
-fail_on_match:
-  - "regex:github_pat_[A-Za-z0-9_]{30,}"
-  - "regex:192\\.168\\."
-allow_domains:           # публичные URL которые ОК
-  - "get.docker.com"
+```
+10.0.0.5 ==> 203.0.113.5
+real-token ==> ***
+regex:[A-Fa-f0-9]{64} ==> ***
+```
+
+**Сложный** — ещё `scan` + `allow`:
+
+```
+# scan:
+regex:github_pat_[A-Za-z0-9_]{30,}
+regex:192\.168\.
+
+# allow:
+get.docker.com
 ```
 
 ## Команды

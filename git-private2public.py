@@ -69,6 +69,79 @@ class Config:
             push_tags=push.get("tags", False),
         )
 
+    @classmethod
+    def from_folder(cls, folder: Path) -> "Config":
+        """Load from a .gitpublic/ folder — each file is one concern, gitignore-style.
+
+        Files (all optional — if missing, that setting is empty):
+          config      — source=, target=, push_force=, push_branches= (key=value)
+          ignore      — one path/glob per line (# for comments)
+          replace     — old==>new per line (regex: prefix supported, glob:*.ext: scoped)
+          scan        — one regex/literal per line (fail_on_match)
+          allow       — one domain per line
+        """
+        def read_lines(name: str) -> list[str]:
+            f = folder / name
+            if not f.exists():
+                return []
+            lines = []
+            for line in f.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lines.append(line)
+            return lines
+
+        # config file — simple key=value
+        source = ""
+        target = ""
+        push_force = True
+        push_branches = ["main"]
+        push_tags = False
+        cfg_file = folder / "config"
+        if cfg_file.exists():
+            for line in cfg_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k == "source":
+                    source = v
+                elif k == "target":
+                    target = v
+                elif k == "push_force":
+                    push_force = v.lower() in ("true", "yes", "1")
+                elif k == "push_branches":
+                    push_branches = [b.strip() for b in v.split(",") if b.strip()]
+                elif k == "push_tags":
+                    push_tags = v.lower() in ("true", "yes", "1")
+
+        return cls(
+            source=source,
+            target=target,
+            delete=read_lines("ignore"),
+            replace=read_lines("replace"),
+            allow_domains=read_lines("allow"),
+            fail_on_match=read_lines("scan"),
+            push_force=push_force,
+            push_branches=push_branches,
+            push_tags=push_tags,
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Config":
+        """Auto-detect: .gitpublic/ folder OR .yaml file."""
+        p = Path(path)
+        if p.is_dir():
+            return cls.from_folder(p)
+        # If path doesn't exist, try .gitpublic/ folder in same dir
+        if not p.exists():
+            folder = p.parent / ".gitpublic"
+            if folder.is_dir():
+                return cls.from_folder(folder)
+        return cls.from_yaml(p)
+
 
 # --------------------------------------------------------------------------- #
 # Rule parsing
@@ -417,44 +490,96 @@ def find_git_root(start: Path) -> Path | None:
     return None
 
 
+# Files written by `init` into .gitpublic/
+GITPUBLIC_FILES = {
+    "config": """# Required: which repos to sync
+source = you/private-repo
+target = you/public-repo
+
+# Push settings
+push_force = true
+push_branches = main
+""",
+    "ignore": """# Files/dirs to NOT publish. Like .gitignore, one per line.
+.env
+secrets/
+*.key
+*.pem
+""",
+    "replace": """# Find ==> replace, one per line. Literal by default.
+# Prefix with regex: for regex. glob:*.json: to scope to file type.
+# 10.0.0.5 ==> 203.0.113.5
+# real-token ==> ***
+# regex:[A-Fa-f0-9]{64} ==> ***
+""",
+    "scan": """# Refuse to push if these appear in the result. One per line.
+# regex:github_pat_[A-Za-z0-9_]{30,}
+# regex:sk-[A-Za-z0-9]{40,}
+# regex:192\\.168\\.
+""",
+    "allow": """# Domains that are OK to publish (won't trigger scan).
+# get.docker.com
+# example.com
+""",
+}
+
+
 def cmd_init(args) -> int:
-    out = Path(args.path)
-    if out.exists() and not args.force:
-        sys.exit(f"{out} exists (use --force to overwrite)")
-    out.write_text(EXAMPLE_CONFIG)
-    print(f"✓ Wrote example config to {out}")
+    # Folder mode: .gitpublic/ with one file per concern (like .gitignore)
+    folder = Path(args.path)
+    if folder.is_file() and folder.suffix in (".yaml", ".yml"):
+        # Legacy YAML mode
+        if folder.exists() and not args.force:
+            sys.exit(f"{folder} exists (use --force to overwrite)")
+        folder.write_text(EXAMPLE_CONFIG)
+        print(f"✓ Wrote example config to {folder}")
+        return 0
+
+    # Default: folder mode
+    if folder.exists() and not args.force:
+        sys.exit(f"{folder} exists (use --force to overwrite)")
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, content in GITPUBLIC_FILES.items():
+        (folder / name).write_text(content)
+    print(f"✓ Created {folder}/ with:")
+    for name in GITPUBLIC_FILES:
+        print(f"    {name}")
+    print()
+    print(f"  Edit {folder}/config  — set source + target")
+    print(f"  Edit {folder}/ignore  — files to hide (like .gitignore)")
+    print(f"  Run: git-private2public publish")
     return 0
 
 
 def cmd_publish(args) -> int:
-    config = Config.from_yaml(Path(args.config))
+    config = Config.load(args.config)
     return publish(config, scan_only=args.scan)
 
 
 def cmd_scan(args) -> int:
-    config = Config.from_yaml(Path(args.config))
+    config = Config.load(args.config)
     return publish(config, scan_only=True)
 
 
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="git-private2public",
-        description="Sanitize & mirror a private repo to a public one. Config-driven.",
+        description="Like .gitignore, but for what goes public. Folder-based config.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_init = sub.add_parser("init", help="write an example config")
-    p_init.add_argument("path", nargs="?", default=".git-private2public.yaml")
+    p_init.add_argument("path", nargs="?", default=".gitpublic")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
     p_pub = sub.add_parser("publish", help="sanitize + push to target")
-    p_pub.add_argument("-c", "--config", default=".git-private2public.yaml")
+    p_pub.add_argument("-c", "--config", default=".gitpublic")
     p_pub.add_argument("--scan", action="store_true", help="scan only, don't push")
     p_pub.set_defaults(func=cmd_publish)
 
     p_scan = sub.add_parser("scan", help="scan only (no push)")
-    p_scan.add_argument("-c", "--config", default=".git-private2public.yaml")
+    p_scan.add_argument("-c", "--config", default=".gitpublic")
     p_scan.set_defaults(func=cmd_scan)
 
     p_hook = sub.add_parser("hook", help="enable/disable a local git pre-push hook")
@@ -462,7 +587,7 @@ def main() -> int:
     p_hook_sub.add_parser("enable", help="install the pre-push hook (auto-publish on every git push)")
     p_hook_sub.add_parser("disable", help="remove the hook")
     p_hook_sub.add_parser("status", help="show whether the hook is on or off")
-    p_hook.add_argument("-c", "--config", default=".git-private2public.yaml")
+    p_hook.add_argument("-c", "--config", default=".gitpublic")
     p_hook.set_defaults(func=cmd_hook)
 
     args = p.parse_args()

@@ -13,19 +13,22 @@ tool keeps them in sync. Automatically.
 
 ```bash
 pip install git-filter-repo pyyaml
-git-private2public init          # creates .git-private2public.yaml
+git-private2public init          # creates .gitpublic/ folder
 ```
 
-Edit the config — say what to hide:
+Edit `.gitpublic/config` — set source + target:
 
-```yaml
-source: you/private-repo
-target: you/public-repo
+```
+source = you/private-repo
+target = you/public-repo
+```
 
-ignore:
-  - ".env"
-  - "secrets/"
-  - "*.key"
+Edit `.gitpublic/ignore` — files to hide, one per line (like `.gitignore`):
+
+```
+.env
+secrets/
+*.key
 ```
 
 Publish:
@@ -46,28 +49,44 @@ git-private2public hook disable    # off
 
 Native git hook. No CI, no GitHub Actions. Works offline.
 
-## Modes
+## The `.gitpublic/` folder
 
-**Easy** — just ignore files (the example above).
+Each file is one concern. Like `.gitignore` — one rule per line, `#` for
+comments. If a file is missing, that setting is just empty.
 
-**Medium** — also scrub secrets inside files:
+| File | What goes in it | Format |
+|------|-----------------|--------|
+| `config` | source, target, push settings | `key = value` |
+| `ignore` | files to NOT publish | one path/glob per line |
+| `replace` | find → replace in file contents | `old ==> new` per line |
+| `scan` | refuse to push if matched | one pattern per line |
+| `allow` | domains OK to publish | one per line |
 
-```yaml
-replace:
-  - "10.0.0.5==>203.0.113.5"
-  - "real-token==>***"
+**Easy** — just edit `ignore`:
+
+```
+.env
+secrets/
+*.key
 ```
 
-**Hard** — regex, scan, refuse to push if anything survives:
+**Medium** — also edit `replace`:
 
-```yaml
-replace:
-  - "regex:[A-Fa-f0-9]{64}==>***"
-fail_on_match:
-  - "regex:github_pat_[A-Za-z0-9_]{30,}"
-  - "regex:192\\.168\\."
-allow_domains:           # public URLs that are OK
-  - "get.docker.com"
+```
+10.0.0.5 ==> 203.0.113.5
+real-token ==> ***
+regex:[A-Fa-f0-9]{64} ==> ***
+```
+
+**Hard** — also edit `scan` + `allow`:
+
+```
+# scan:
+regex:github_pat_[A-Za-z0-9_]{30,}
+regex:192\.168\.
+
+# allow:
+get.docker.com
 ```
 
 ## Commands
