@@ -101,10 +101,13 @@ hook        enable / disable / status
 ## Установка
 
 ```bash
-pip install git-filter-repo pyyaml
-curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git-private2public.py \
-  -o git-private2public && chmod +x git-private2public
+pip install git-private2public
 ```
+
+Готово. Теперь есть команда `git-private2public`.
+
+> Без pip? [Ручная установка одного файла](./git_private2public.py) — скачать +
+> `chmod +x` (нужно `pip install git-filter-repo pyyaml`).
 
 ## Зачем
 
