@@ -6,6 +6,8 @@
 
 **Like `.gitignore`, but for what goes public.**
 
+Need the full rule-by-rule explanation? Read [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
+
 You have a private repo. You want a public one — without the secrets. This
 tool keeps them in sync. Automatically.
 
@@ -102,27 +104,41 @@ hook        enable / disable / status
 
 ## How `allow` / domains work
 
-`allow` is not a replacement rule. It is an allowlist used during scanning.
+Nothing is auto-blocked just because it is a domain.
 
-Example: put a broad domain detector into `.gitpublic/scan`:
+`allow` is only used by `scan`. If `.gitpublic/scan` is missing or empty, domains are not checked at all.
+
+To block domain-looking strings, add a broad domain rule to `.gitpublic/scan`:
 
 ```
 regex:[a-z0-9.-]+\.[a-z]{2,}
 ```
 
-Now every domain-like string fails the scan unless the matched domain is listed in `.gitpublic/allow`:
+Now every matched domain fails the scan unless the matched domain itself is listed in `.gitpublic/allow`:
 
 ```
 github.com
 get.docker.com
+example.com
 ```
 
-Use `.gitpublic/replace` to rewrite private domains, for example:
+`allow` does not replace private domains. Use `.gitpublic/replace` for that:
 
 ```
 private.company.local ==> example.com
 regex:.*\.corp\.internal ==> example.com
 ```
+
+Rule of thumb:
+
+| You want to... | File |
+|---|---|
+| remove files | `.gitpublic/ignore` |
+| rewrite private text/domain/IP | `.gitpublic/replace` |
+| fail if a secret/domain/IP survived | `.gitpublic/scan` |
+| permit public domains found by scan | `.gitpublic/allow` |
+
+More examples: [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
 
 ## Install
 

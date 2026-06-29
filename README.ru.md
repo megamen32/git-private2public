@@ -6,6 +6,8 @@
 
 **Как `.gitignore`, только для публичности.**
 
+Нужно полное объяснение всех правил? См. [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
+
 У тебя приватный репо. Нужен публичный — без секретов. Эта тулза держит их в
 синке. Автоматически.
 
@@ -102,27 +104,41 @@ hook        enable / disable / status
 
 ## Как работает `allow` / domains
 
-`allow` — это не замена текста. Это allowlist для этапа сканирования.
+Ничего не автоблокируется просто потому, что это домен.
 
-Пример: добавь широкий детектор доменов в `.gitpublic/scan`:
+`allow` используется только вместе со `scan`. Если `.gitpublic/scan` отсутствует или пустой, домены вообще не проверяются.
+
+Чтобы блокировать похожие на домены строки, добавь широкий regex в `.gitpublic/scan`:
 
 ```
 regex:[a-z0-9.-]+\.[a-z]{2,}
 ```
 
-Теперь любой похожий на домен текст валит scan, кроме случаев, когда сам найденный домен есть в `.gitpublic/allow`:
+Теперь любой найденный домен валит scan, кроме случаев, когда сам найденный домен перечислен в `.gitpublic/allow`:
 
 ```
 github.com
 get.docker.com
+example.com
 ```
 
-Для переписывания приватных доменов используй `.gitpublic/replace`:
+`allow` не заменяет приватные домены. Для замены используй `.gitpublic/replace`:
 
 ```
 private.company.local ==> example.com
 regex:.*\.corp\.internal ==> example.com
 ```
+
+Коротко:
+
+| Что нужно | Файл |
+|---|---|
+| удалить файлы | `.gitpublic/ignore` |
+| переписать приватный текст/домен/IP | `.gitpublic/replace` |
+| упасть, если секрет/домен/IP выжил | `.gitpublic/scan` |
+| разрешить публичные домены, найденные scan | `.gitpublic/allow` |
+
+Больше примеров: [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
 
 ## Установка
 
