@@ -126,29 +126,28 @@ git-private2public publish
 
 Or put the token in the target URL in the config.
 
-## Auto-run in CI
+## Auto-publish hook
 
-Add this to `.github/workflows/publish.yml` in your **private** repo. Every
-push to `main` → clean public mirror.
+Want every push to your private repo to auto-publish the clean public mirror?
+There's a ready workflow with an **on/off toggle**.
+
+1. Copy [`templates/publish.yml`](./templates/publish.yml) into your **private**
+   repo at `.github/workflows/publish.yml`
+2. Add a secret `PUBLIC_REPO_PAT` (a GitHub token with push access to your
+   public repo)
+3. Done. Every push to `main` → clean public mirror.
+
+**Toggle on/off** — at the top of the workflow:
 
 ```yaml
-on:
-  push:
-    branches: [main]
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - run: pip install git-filter-repo pyyaml
-      - run: |
-          curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git-private2public.py \
-            -o git-private2public && chmod +x git-private2public
-      - run: ./git-private2public publish -c .git-private2public.yaml
-        env:
-          GIT_PRIVATE2PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
+env:
+  ENABLED: "true"   # set to "false" to pause auto-publish
 ```
+
+You can also run it manually from the Actions tab (`workflow_dispatch`).
+
+The workflow runs `scan` first — if it finds anything that survived your rules,
+it fails **before** pushing. So a bad publish never happens.
 
 ## Why
 

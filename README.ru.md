@@ -125,29 +125,28 @@ git-private2public publish
 
 Или вставь токен прямо в target URL в конфиге.
 
-## Авто-запуск в CI
+## Авто-публикация (хук)
 
-Добавь это в `.github/workflows/publish.yml` в **приватном** репо. Каждый
-push в `main` → чистый публичный mirror.
+Хочешь, чтобы каждый push в приватный репо автоматически публиковал чистый
+публичный mirror? Есть готовый workflow с **переключателем вкл/выкл**.
+
+1. Скопируй [`templates/publish.yml`](./templates/publish.yml) в свой
+   **приватный** репо по пути `.github/workflows/publish.yml`
+2. Добавь секрет `PUBLIC_REPO_PAT` (GitHub токен с push-доступом к публичному
+   репо)
+3. Готово. Каждый push в `main` → чистый публичный mirror.
+
+**Переключатель вкл/выкл** — вверху workflow:
 
 ```yaml
-on:
-  push:
-    branches: [main]
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - run: pip install git-filter-repo pyyaml
-      - run: |
-          curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git-private2public.py \
-            -o git-private2public && chmod +x git-private2public
-      - run: ./git-private2public publish -c .git-private2public.yaml
-        env:
-          GIT_PRIVATE2PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
+env:
+  ENABLED: "true"   # поставь "false" чтобы поставить на паузу
 ```
+
+Также можно запустить вручную из вкладки Actions (`workflow_dispatch`).
+
+Workflow сначала прогоняет `scan` — если найдёт то, что выжило после правил,
+упадёт **до** пуша. Так плохая публикация никогда не случится.
 
 ## Зачем
 
