@@ -1,139 +1,173 @@
-# git-privado
+# git-private2public
 
-**Sanitize & mirror a private repo to a public one — config-driven.**
+**Keep a public copy of your private repo. Automatically scrub secrets.**
 
-`git-privado` is a small CLI that keeps a public mirror of a private repo,
-scrubbed according to rules you define in a YAML file. It wraps
-[`git-filter-repo`](https://github.com/newren/git-filter-repo) with a sane,
-declarative config, and adds a secret-scan gate so the push is refused if
-anything sensitive survives.
+You work in a private repo. It has your real server names, IPs, tokens, personal
+config. You want to also have a public repo — but without leaking any of that.
 
-> Born from a real need: maintaining an open-core project where the private
-> repo has real server names, IPs, tokens, and personal config — and the
-> public repo must never leak any of it.
+This tool does it for you. Every time you run it, it:
 
-## Why
+1. Copies your private repo
+2. Deletes files you said to delete
+3. Replaces secrets with `***`
+4. Checks the result for anything you missed
+5. Pushes the clean version to your public repo
 
-Git and GitHub have no built-in "mark this file private in a public repo".
-Visibility is repo-level. So you need two repos — but syncing them by hand is
-error-prone. Existing tools each do part of the job:
+## The 30-second version
 
-| Tool | Path delete | Text replace | Auto-sync | Config file |
-|------|:-----------:|:------------:|:---------:|:-----------:|
-| git-filter-repo | ✅ | ✅ | ❌ | ❌ |
-| BFG | ✅ | ✅ | ❌ | ❌ |
-| dupligit | ❌ | ❌ | ✅ | ✅ |
-| **git-privado** | ✅ | ✅ | ✅ | ✅ |
-
-## Install
-
-```bash
+```
 pip install git-filter-repo pyyaml
-curl -fsSL https://raw.githubusercontent.com/megamen32/git-privado/main/git-privado.py \
-  -o /usr/local/bin/git-privado && chmod +x /usr/local/bin/git-privado
+
+git-private2public init          # writes a config file
+# edit .git-private2public.yaml — say what to delete and replace
+git-private2public publish       # done
 ```
 
-## Quick start
+That's it. Your public repo is now clean.
 
-```bash
-# 1. Write a config
-git-privado init > .git-privado.yaml
-# edit it
+## Easy mode (just ignore files)
 
-# 2. Scan (no push) — see what would change
-git-privado scan -c .git-privado.yaml
-
-# 3. Publish (sanitize + push to target)
-GITPRIVADO_TOKEN=ghp_xxx git-privado publish -c .git-privado.yaml
-```
-
-## Config reference
+Most people just want to **not publish some files**. Like `.gitignore`, but for
+the public version.
 
 ```yaml
-source: owner/private-repo        # private repo (owner/name, URL, or local path)
-target: owner/public-repo         # public repo to push to
+# .git-private2public.yaml
+source: you/private-repo
+target: you/public-repo
 
-delete:                           # remove from ENTIRE history
-  - "secrets/"                    # directory (trailing /)
-  - "*.env"                       # glob
-  - "config/real-domain.conf"     # exact file
-
-replace:                          # replace in file CONTENTS across history
-  - "real-token-xxx==>***REMOVED***"
-  - "10.0.0.==>192.0.2."          # literal
-  - "regex:[A-Fa-f0-9]{64}==>***REMOVED-HEX***"        # regex
-  - "glob:*.json:secret==>x"      # scoped to *.json files only
-
-allow_domains:                    # domains OK to publish (skip fail_on_match)
-  - "example.com"
-  - "get.docker.com"
-
-fail_on_match:                    # refuse to push if these appear in final tree
-  - "regex:github_pat_[A-Za-z0-9_]{30,}"
-  - "regex:sk-[A-Za-z0-9]{40,}"
-  - "regex:192\\.168\\."
-
-push:
-  force: true                     # required (history is rewritten)
-  branches: [main]
-  tags: false
+ignore:          # these won't be in the public repo. that's it.
+  - ".env"
+  - "secrets/"
+  - "*.key"
+  - "my-personal-notes.md"
+  - "deploy/nginx/real-domain.conf"
 ```
 
-## How it works
+Run `git-private2public publish`. Done.
 
-1. **Clones** the source repo to a temp dir (full history)
-2. **Runs `git-filter-repo`** with `--invert-paths` (delete rules) and
-   `--replace-text` (replace rules) — rewrites ALL history
-3. **Scans** the final tree against `fail_on_match` patterns (with
-   `allow_domains` as escape hatch)
-4. **Pushes** (force) to the target repo — only if scan passes
+## Medium mode (also scrub secrets inside files)
+
+Sometimes a file has both public stuff AND a secret inside. Like a config
+template with your real IP.
+
+```yaml
+source: you/private-repo
+target: you/public-repo
+
+ignore:
+  - ".env"
+
+replace:         # find → replace, in file contents
+  - "10.0.0.5==>203.0.113.5"       # your real IP → example IP
+  - "real-token-xxx==>***"         # your token → stars
+  - "my-server.example.com==>example.com"
+```
+
+## Hard mode (regex, scan, CI, allowlists)
+
+For power users. Full config with all options:
+
+```yaml
+source: you/private-repo
+target: you/public-repo
+
+# Files/dirs to remove from the entire history.
+ignore:
+  - "secrets/"
+  - "*.env"
+  - "*.key"
+
+# Text to replace inside files. Literal by default.
+# Prefix with "regex:" for regex. "glob:*.json:" to scope to file type.
+replace:
+  - "real-token==>***REMOVED***"
+  - "regex:[A-Fa-f0-9]{64}==>***REMOVED***"        # catch any 64-char hex
+  - "glob:*.json:secret==>x"                       # only in .json files
+
+# Domains that are OK to publish (won't trigger the scan below).
+# Use this so public install URLs (like get.docker.com) survive.
+allow_domains:
+  - "get.docker.com"
+  - "example.com"
+
+# Refuse to push if these appear in the final result.
+# Catches anything your rules above missed.
+fail_on_match:
+  - "regex:github_pat_[A-Za-z0-9_]{30,}"     # GitHub tokens
+  - "regex:sk-[A-Za-z0-9]{40,}"              # OpenAI keys
+  - "regex:192\\.168\\."                     # private IPs
+  - "regex:10\\.0\\.0\\."                    # private IPs
+
+push:
+  force: true
+  branches: [main]
+```
+
+## Commands
+
+```
+git-private2public init        # write an example config
+git-private2public scan        # check what would happen (no push)
+git-private2public publish     # sanitize + push to public repo
+```
 
 ## Auth
 
-For GitHub targets, set `GITPRIVADO_TOKEN` env var (a PAT with push access to
-the target repo). It's injected as `x-access-token:` in the push URL.
+For GitHub, set a token so it can push to your public repo:
 
-For other hosts, embed creds in the `target:` URL or use a git credential
-helper.
+```bash
+export GIT_PRIVATE2PUBLIC_TOKEN=ghp_xxx
+git-private2public publish
+```
 
-## CI (GitHub Actions)
+Or put the token in the target URL in the config.
+
+## Auto-run in CI
+
+Add this to `.github/workflows/publish.yml` in your **private** repo. Every
+push to `main` → clean public mirror.
 
 ```yaml
-# .github/workflows/publicize.yml
 on:
   push:
     branches: [main]
 jobs:
-  publicize:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - run: pip install git-filter-repo pyyaml
-      - run: curl -fsSL https://raw.githubusercontent.com/megamen32/git-privado/main/git-privado.py -o git-privado && chmod +x git-privado
-      - run: ./git-privado publish -c .git-privado.yaml
+      - run: |
+          curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git-private2public.py \
+            -o git-private2public && chmod +x git-private2public
+      - run: ./git-private2public publish -c .git-private2public.yaml
         env:
-          GITPRIVADO_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
+          GIT_PRIVATE2PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
 ```
 
-## Rule format cheatsheet
+## Why
 
-| Rule type | Syntax | Example |
-|-----------|--------|---------|
-| Delete dir | `dir/` | `secrets/` |
-| Delete glob | `*.ext` | `*.env` |
-| Delete file | `path` | `config/real.conf` |
-| Replace literal | `old==>new` | `secret==>***` |
-| Replace regex | `regex:pat==>new` | `regex:[0-9a-f]{64}==>*` |
-| Replace scoped | `glob:*.json:old==>new` | glob + literal |
+Git and GitHub have no built-in "make this file private in a public repo".
+Visibility is repo-level. So you need two repos. This tool keeps them in sync
+without leaking.
 
-## Why not just git-filter-repo?
+Other tools do part of the job:
 
-`git-filter-repo` is the engine. git-privado adds:
-- **One config file** instead of re-typing CLI args every time
-- **Secret-scan gate** — refuse to push if `fail_on_match` hits anything
-- **Allowlist** — keep public install URLs while scrubbing private IPs
-- **Push automation** — clone → filter → scan → push in one command
+| | delete files | replace text | scan for leaks | auto push | one config |
+|---|:---:|:---:|:---:|:---:|:---:|
+| git-filter-repo | ✅ | ✅ | ❌ | ❌ | ❌ |
+| BFG | ✅ | ✅ | ❌ | ❌ | ❌ |
+| dupligit | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **git-private2public** | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+## Install
+
+```bash
+pip install git-filter-repo pyyaml
+curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git-private2public.py \
+  -o git-private2public && chmod +x git-private2public
+```
 
 ## License
 

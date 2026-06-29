@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-git-privado — sanitize & mirror a private repo to a public one.
+git-private2public & mirror a private repo to a public one.
 
 Config-driven wrapper over git-filter-repo:
   - delete paths (globs, dirs, exact files) from history
@@ -9,9 +9,9 @@ Config-driven wrapper over git-filter-repo:
   - push to the target public repo
 
 Usage:
-  git-privado publish --config rules.yaml
-  git-privado scan --config rules.yaml       # scan only, don't push
-  git-privado init                           # write example config
+  git-private2public publish --config rules.yaml
+  git-private2public scan --config rules.yaml       # scan only, don't push
+  git-private2public init                           # write example config
 
 Install:
   pip install git-filter-repo pyyaml
@@ -45,7 +45,7 @@ except ImportError:
 class Config:
     source: str
     target: str
-    delete: list[str] = field(default_factory=list)
+    delete: list[str] = field(default_factory=list)  # alias: ignore
     replace: list[str] = field(default_factory=list)
     allow_domains: list[str] = field(default_factory=list)
     fail_on_match: list[str] = field(default_factory=list)
@@ -60,7 +60,7 @@ class Config:
         return cls(
             source=data["source"],
             target=data["target"],
-            delete=list(data.get("delete") or []),
+            delete=list(data.get("delete") or data.get("ignore") or []),
             replace=list(data.get("replace") or []),
             allow_domains=list(data.get("allow_domains") or []),
             fail_on_match=list(data.get("fail_on_match") or []),
@@ -141,7 +141,7 @@ class ReplaceRule:
 # --------------------------------------------------------------------------- #
 
 def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    if os.environ.get("GITPRIVADO_DEBUG"):
+    if os.environ.get("GIT_PRIVATE2PUBLIC_DEBUG"):
         sys.stderr.write(f"$ {' '.join(cmd)}\n")
     return subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True)
 
@@ -232,7 +232,7 @@ def publish(config: Config, scan_only: bool = False) -> int:
     deletes = [DeleteRule.parse(d) for d in config.delete]
     replaces = [ReplaceRule.parse(r) for r in config.replace]
 
-    with tempfile.TemporaryDirectory(prefix="git-privado-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="git-private2public-") as tmp:
         tmp_path = Path(tmp)
         work = tmp_path / "work"
 
@@ -287,7 +287,7 @@ def publish(config: Config, scan_only: bool = False) -> int:
             target_url = f"https://github.com/{target_url}.git"
 
         # Auth from env if provided
-        token = os.environ.get("GITPRIVADO_TOKEN")
+        token = os.environ.get("GIT_PRIVATE2PUBLIC_TOKEN")
         if token and "github.com" in target_url:
             target_url = target_url.replace("https://", f"https://x-access-token:{token}@")
 
@@ -321,34 +321,30 @@ def publish(config: Config, scan_only: bool = False) -> int:
 # --------------------------------------------------------------------------- #
 
 EXAMPLE_CONFIG = """\
-# git-privado configuration
+# git-private2public config
+# Easy mode: just list files to NOT publish. Like .gitignore.
+
 source: owner/private-repo
 target: owner/public-repo
 
-delete:
+ignore:          # these won't be in the public repo
+  - ".env"
   - "secrets/"
-  - "*.env"
   - "*.key"
-  - "private-config.yml"
 
-replace:
-  - "my-secret-token==>***REMOVED***"
-  - "10.0.0.==>192.0.2."
-  - "regex:[A-Fa-f0-9]{64}==>***REMOVED-HEX***"
+# --- medium mode (uncomment to scrub secrets inside files) ---
+# replace:
+#   - "10.0.0.5==>203.0.113.5"
+#   - "real-token==>***"
 
-allow_domains:
-  - "example.com"
-  - "github.com"
-
-fail_on_match:
-  - "regex:github_pat_[A-Za-z0-9_]{30,}"
-  - "regex:sk-[A-Za-z0-9]{40,}"
-  - "regex:192\\.168\\."
+# --- hard mode (uncomment to refuse push if these survive) ---
+# fail_on_match:
+#   - "regex:github_pat_[A-Za-z0-9_]{30,}"
+#   - "regex:192\\.168\\."
 
 push:
   force: true
   branches: [main]
-  tags: false
 """
 
 
@@ -373,23 +369,23 @@ def cmd_scan(args) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        prog="git-privado",
+        prog="git-private2public",
         description="Sanitize & mirror a private repo to a public one. Config-driven.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_init = sub.add_parser("init", help="write an example config")
-    p_init.add_argument("path", nargs="?", default=".git-privado.yaml")
+    p_init.add_argument("path", nargs="?", default=".git-private2public.yaml")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
     p_pub = sub.add_parser("publish", help="sanitize + push to target")
-    p_pub.add_argument("-c", "--config", default=".git-privado.yaml")
+    p_pub.add_argument("-c", "--config", default=".git-private2public.yaml")
     p_pub.add_argument("--scan", action="store_true", help="scan only, don't push")
     p_pub.set_defaults(func=cmd_publish)
 
     p_scan = sub.add_parser("scan", help="scan only (no push)")
-    p_scan.add_argument("-c", "--config", default=".git-privado.yaml")
+    p_scan.add_argument("-c", "--config", default=".git-private2public.yaml")
     p_scan.set_defaults(func=cmd_scan)
 
     args = p.parse_args()

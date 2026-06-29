@@ -1,65 +1,24 @@
-# git-privado configuration
-# =========================
-# Mirror a private repo to a public one, sanitized according to these rules.
-# See: https://github.com/megamen32/git-privado
+# git-private2public config
+# Easy mode: just list files to NOT publish. Like .gitignore.
 
-source: megamen32/gptadmin        # private repo (HTTPS, or local path)
-target: megamen32/gptadmin_opensource  # public repo to push to
+source: owner/private-repo
+target: owner/public-repo
 
-# Delete these paths from the ENTIRE history of the target.
-# Globs supported (*.key), directories end with /, exact files verbatim.
-delete:
-  - apps/                          # whole dir
-  - "GPTADMIN_PROMPT.md"           # exact file
-  - "deploy/nginx/became.bezrabotnyi.com.conf"
-  - "docs/old_prompt.txt"
-  - ".claude/"
-  - ".serena/"
-  - "*.env"
+ignore:          # these won't be in the public repo
+  - ".env"
+  - "secrets/"
   - "*.key"
-  - "*.pem"
 
-# Replace text in file CONTENTS across all history.
-# Format: "pattern==>replacement". Literal strings by default.
-# Prefix pattern with "regex:" for regex, "glob:*.json:" to scope to files.
-replace:
-  - "aofhkLSD25i==>***REMOVED***"
-  - "95.165.165.65==>203.0.113.10"
-  - "95.31.7.115==>203.0.113.11"
-  - "roomhacker-server-100==>server-01"
-  - "roomhacker-server-88==>server-02"
-  - "server-44==>server-03"
-  - "roomhacker==>admin"
-  - "192.168.1.==>10.0.0."
-  - "192.168.2.==>10.0.0."
-  - "megamen932@gmai.com==>noreply@example.com"
-  - "regex:[a-f0-9]{64}==>***REMOVED-HEX64***"   # catch leaked 64-char hex tokens
+# --- medium mode (uncomment to scrub secrets inside files) ---
+# replace:
+#   - "10.0.0.5==>203.0.113.5"
+#   - "real-token==>***"
 
-# Allowlist of domains that are OK to publish (won't trigger fail_on_match).
-# Used so install URLs (became.bezrabotnyi.com/install.sh) survive the scan.
-allow_domains:
-  - "became.bezrabotnyi.com"        # public install endpoint
-  - "t.gptadmin.bezrabotnyi.com"    # public FRP server
-  - "github.com"
-  - "example.com"
-  - "example.org"
+# --- hard mode (uncomment to refuse push if these survive) ---
+# fail_on_match:
+#   - "regex:github_pat_[A-Za-z0-9_]{30,}"
+#   - "regex:192\.168\."
 
-# Fail (exit 1, don't push) if these patterns appear in the final tree.
-# Catches anything the rules above missed.
-fail_on_match:
-  - "regex:github_pat_[A-Za-z0-9_]{30,}"       # GitHub PAT
-  - "regex:gh[po]sr?_[A-Za-z0-9]{36,}"          # GitHub token
-  - "regex:sk-[A-Za-z0-9]{40,}"                 # OpenAI key
-  - "regex:AKIA[0-9A-Z]{16}"                    # AWS key
-  - "regex:xox[baprs]-[A-Za-z0-9-]{10,}"        # Slack token
-  # Private IPv4 ranges (RFC1918) — your internal network
-  - "regex:10\\.0\\.0\\.[0-9]+"                 # NOTE: adjust if you use 10.x
-  - "regex:172\\.(1[6-9]|2[0-9]|3[01])\\."       # 172.16/12
-  - "regex:192\\.168\\."                         # 192.168/16
-
-# Push settings
 push:
-  force: true                      # required — history is rewritten
-  branches:
-    - main
-  tags: false                      # don't push tags by default
+  force: true
+  branches: [main]
