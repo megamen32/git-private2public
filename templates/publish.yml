@@ -1,0 +1,46 @@
+# Auto-publish a clean public mirror on every push to main.
+# Put this file in your PRIVATE repo at .github/workflows/publish.yml
+#
+# Toggle: set ENABLED to false to pause auto-publish without deleting the file.
+name: publish-public-mirror
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # also runnable manually from Actions tab
+
+# ────────────────────────────────────────────────────────────────────
+#  TOGGLE: set to false to disable auto-publish (hook off)
+# ────────────────────────────────────────────────────────────────────
+env:
+  ENABLED: "true"
+
+jobs:
+  publish:
+    if: env.ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: pip install git-filter-repo pyyaml
+
+      - name: Install git-private2public
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/megamen32/git-private2public/main/git-private2public.py \
+            -o git-private2public && chmod +x git-private2public
+
+      - name: Scan (no push) — see what would change
+        run: ./git-private2public scan -c .git-private2public.yaml
+
+      - name: Publish to public repo
+        run: ./git-private2public publish -c .git-private2public.yaml
+        env:
+          GIT_PRIVATE2PUBLIC_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
+
+      - name: Disabled — hook is off
+        if: env.ENABLED != 'true'
+        run: echo "Auto-publish is disabled. Set ENABLED=true in this workflow to turn it back on."

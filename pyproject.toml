@@ -1,0 +1,37 @@
+[project]
+name = "git-private2public"
+version = "0.1.0"
+description = "Like .gitignore, but for what goes public. Keep a sanitized public mirror of your private repo."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "megamen32"}]
+keywords = ["git", "security", "open-source", "privacy", "secrets", "sanitization", "mirror", "public"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Security",
+]
+dependencies = [
+    "git-filter-repo>=2.38",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+git-private2public = "git_private2public:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Single-file module — include the .py at root
+only-include = ["git_private2public.py"]

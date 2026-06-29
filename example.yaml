@@ -1,0 +1,24 @@
+# git-private2public config
+# Easy mode: just list files to NOT publish. Like .gitignore.
+
+source: owner/private-repo
+target: owner/public-repo
+
+ignore:          # these won't be in the public repo
+  - ".env"
+  - "secrets/"
+  - "*.key"
+
+# --- medium mode (uncomment to scrub secrets inside files) ---
+# replace:
+#   - "<PRIVATE_IP>==>203.0.113.5"
+#   - "real-token==>***"
+
+# --- hard mode (uncomment to refuse push if these survive) ---
+# fail_on_match:
+#   - "regex:github_pat_[A-Za-z0-9_]{30,}"
+#   - "regex:192\.168\."
+
+push:
+  force: true
+  branches: [main]
