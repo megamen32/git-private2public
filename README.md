@@ -1,5 +1,9 @@
 # git-private2public
 
+**[English](./README.md)** · **[Русский](./README.ru.md)**
+
+---
+
 **Keep a public copy of your private repo. Automatically scrub secrets.**
 
 You work in a private repo. It has your real server names, IPs, tokens, personal
