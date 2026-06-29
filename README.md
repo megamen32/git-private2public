@@ -115,6 +115,21 @@ git-private2public scan        # check what would happen (no push)
 git-private2public publish     # sanitize + push to public repo
 ```
 
+## Auto-publish on every `git push` (local hook)
+
+Don't want to think about it? Enable a local git hook. Then every `git push`
+to your private repo also publishes the clean public mirror — automatically.
+
+```
+git-private2public hook enable     # turn it on
+git push                           # also publishes public mirror
+git-private2public hook disable    # turn it off
+git-private2public hook status     # see if it's on
+```
+
+This installs a native git `pre-push` hook (in `.git/hooks/`). No GitHub
+Actions, no CI — works fully offline, on any git host.
+
 ## Auth
 
 For GitHub, set a token so it can push to your public repo:
