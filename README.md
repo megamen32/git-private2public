@@ -62,7 +62,7 @@ comments. If a file is missing, that setting is just empty.
 | `ignore` | files to NOT publish | one path/glob per line |
 | `replace` | find → replace in file contents | `old ==> new` per line |
 | `scan` | refuse to push if matched | one pattern per line |
-| `allow` | domains OK to publish when scan matches nearby text | one domain per line |
+| `allow` | exceptions for domain rules in `scan` | one allowed matched domain per line |
 
 **Easy** — just edit `ignore`:
 
@@ -106,7 +106,7 @@ hook        enable / disable / status
 
 Nothing is auto-blocked just because it is a domain.
 
-`allow` is only used by `scan`. If `.gitpublic/scan` is missing or empty, domains are not checked at all.
+`allow` is an exception list for `scan`. If `.gitpublic/scan` is missing or empty, `allow` does nothing and domains are not checked at all.
 
 To block domain-looking strings, add a broad domain rule to `.gitpublic/scan`:
 
@@ -129,6 +129,8 @@ private.company.local ==> example.com
 regex:.*\.corp\.internal ==> example.com
 ```
 
+Analogy: `scan` says “ban everything matching this pattern”, `allow` says “except these exact public domains”.
+
 Rule of thumb:
 
 | You want to... | File |
@@ -136,7 +138,7 @@ Rule of thumb:
 | remove files | `.gitpublic/ignore` |
 | rewrite private text/domain/IP | `.gitpublic/replace` |
 | fail if a secret/domain/IP survived | `.gitpublic/scan` |
-| permit public domains found by scan | `.gitpublic/allow` |
+| make exceptions for public domains caught by scan | `.gitpublic/allow` |
 
 More examples: [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
 

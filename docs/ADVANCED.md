@@ -24,7 +24,7 @@ Missing files mean “no rules for that step”. They do not enable hidden defau
 | `.gitpublic/ignore` | Removes matching files/paths from all published history | No files are removed |
 | `.gitpublic/replace` | Rewrites matching text in remaining files | No text is rewritten |
 | `.gitpublic/scan` | Fails if any scan pattern is still present after cleanup | Nothing is blocked by scan |
-| `.gitpublic/allow` | Allows specific matched domains during scan | Nothing is allowlisted |
+| `.gitpublic/allow` | Exceptions for domain-like matches found by `scan` | No scan exceptions exist |
 | `.gitpublic/domains` | Same as `allow` alias | Nothing is allowlisted |
 
 ## `.gitpublic/config`
@@ -122,7 +122,7 @@ If `.gitpublic/scan` does not exist or has no active rules, nothing is blocked a
 
 ## Domains and `.gitpublic/allow`
 
-There is no automatic “block all domains” mode.
+Deny-all-with-exceptions is opt-in. There is no automatic “block all domains” mode.
 
 Domains are blocked only if you add a domain rule to `.gitpublic/scan`, for example:
 
@@ -142,7 +142,7 @@ example.com
 
 Important details:
 
-- `allow` does not scan by itself;
+- `allow` does not scan by itself; it only cancels a matching `scan` violation for the exact allowed domain;
 - `allow` does not replace anything;
 - `allow` only matters when a `scan` rule matched;
 - `allow` is checked against the matched text itself, not nearby text;
@@ -212,7 +212,7 @@ Result:
 | Delete files | `ignore` |
 | Rewrite a private value | `replace` |
 | Refuse publish if value survived | `scan` |
-| Permit a public domain matched by broad domain scan | `allow` |
+| Make an exception for a public domain matched by broad domain scan | `allow` |
 | Auto-block every domain | add a broad domain regex to `scan` |
 | Auto-block secrets without rules | not supported; write `scan` rules or use external scanners before publishing |
 
