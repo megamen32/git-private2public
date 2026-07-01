@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 try:
     import yaml
@@ -243,7 +243,34 @@ def mask_url(url: str) -> str:
     return re.sub(r"https://[^/@]+@", "https://***@", url)
 
 
-def validate_config(config: Config) -> None:
+def validate_config(config: Config, cwd: str | None = None) -> None:
+    """Validate config and apply single-repo fallback.
+
+    Single-repo mode kicks in when source and target are both empty: in
+    that case we treat the current repo's origin as both — sanitize it in
+    place and force-push back. Useful for small projects where maintaining
+    two repos (private + public) is overkill.
+    """
+    if not config.source and not config.target:
+        cwd = cwd or os.getcwd()
+        res = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            raise SystemExit(
+                "single-repo mode: no source/target configured and no "
+                "git 'origin' remote in current directory"
+            )
+        origin = res.stdout.strip()
+        config.source = origin
+        config.target = origin
+        print(f"▸ single-repo mode: source = target = {mask_url(origin)}", file=sys.stderr)
+    elif not config.target:
+        config.target = config.source
+    elif not config.source:
+        config.source = config.target
+
     missing = []
     if not config.source:
         missing.append("source")
@@ -340,8 +367,8 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
 # Publish flow
 # --------------------------------------------------------------------------- #
 
-def publish(config: Config, scan_only: bool = False) -> int:
-    validate_config(config)
+def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> int:
+    validate_config(config, cwd=cwd)
     deletes = [DeleteRule.parse(d) for d in config.delete]
     replaces = [ReplaceRule.parse(r) for r in config.replace]
 
@@ -595,12 +622,12 @@ def cmd_init(args) -> int:
 
 def cmd_publish(args) -> int:
     config = Config.load(args.config)
-    return publish(config, scan_only=args.scan)
+    return publish(config, scan_only=args.scan, cwd=os.getcwd())
 
 
 def cmd_scan(args) -> int:
     config = Config.load(args.config)
-    return publish(config, scan_only=True)
+    return publish(config, scan_only=True, cwd=os.getcwd())
 
 
 def main() -> int:

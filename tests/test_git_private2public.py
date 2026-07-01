@@ -96,4 +96,38 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.1"
+    assert g.__version__ == "0.1.2"
+
+
+def test_validate_config_single_repo_falls_back_to_origin(tmp_path: Path, monkeypatch):
+    """When source and target are both empty, validate_config picks up the
+    current repo's origin URL and uses it for both sides (single-repo mode)."""
+    cfg = g.Config(source="", target="")
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: subprocess_completed(
+        stdout="git@github.com:me/repo.git\n", returncode=0
+    ))
+    g.validate_config(cfg, cwd=str(tmp_path))
+    assert cfg.source == "git@github.com:me/repo.git"
+    assert cfg.target == "git@github.com:me/repo.git"
+
+
+def test_validate_config_single_repo_errors_without_origin(tmp_path: Path, monkeypatch):
+    cfg = g.Config(source="", target="")
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: subprocess_completed(
+        stdout="", returncode=128
+    ))
+    with pytest.raises(SystemExit, match="single-repo mode"):
+        g.validate_config(cfg, cwd=str(tmp_path))
+
+
+def test_validate_config_mirror_mode_fills_missing_side():
+    cfg = g.Config(source="git@github.com:me/priv.git", target="")
+    g.validate_config(cfg)
+    assert cfg.target == "git@github.com:me/priv.git"
+
+
+import subprocess as _sp
+
+
+def subprocess_completed(stdout: str = "", returncode: int = 0) -> _sp.CompletedProcess:
+    return _sp.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
