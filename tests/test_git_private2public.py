@@ -97,7 +97,7 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.6"
+    assert g.__version__ == "0.1.7"
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -383,8 +383,35 @@ def test_guard_run_message_mentions_working_tree_fix(tmp_path: Path, monkeypatch
     assert "git-private2public publish" not in out
 
 
+def test_publish_uses_plain_force_not_force_with_lease():
+    """Regressed once: --force-with-lease failed with 'stale info' because
+    the freshly-added target remote has no remote-tracking ref to compare
+    against. We must use plain --force."""
+    import inspect
+    import re as _re
+    src = inspect.getsource(g.publish)
+    # Drop comments so we only look at real code.
+    code = _re.sub(r"#[^\n]*\n", "", src)
+    assert '"--force"' in code or "'--force'" in code
+    assert "force-with-lease" not in code
+
+
 import subprocess as _sp
 
 
 def subprocess_completed(stdout: str = "", returncode: int = 0) -> _sp.CompletedProcess:
     return _sp.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+def test_publish_uses_plain_force_not_force_with_lease():
+    """Regressed to --force-with-lease once: that failed with 'stale info'
+    because the freshly-added 'target' remote has no remote-tracking ref
+    to compare against, so --force-with-lease refuses to push. We must
+    use plain --force after a clone we just performed ourselves."""
+    import inspect
+    import re as _re
+    src = inspect.getsource(g.publish)
+    # Drop comment lines so we only inspect real code, not prose.
+    code = _re.sub(r"#[^\n]*\n", "", src)
+    assert '"--force"' in code or "'--force'" in code
+    assert "force-with-lease" not in code

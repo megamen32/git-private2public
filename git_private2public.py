@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 try:
     import yaml
@@ -533,7 +533,12 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
         for branch in config.push_branches:
             push_cmd = ["git", "push"]
             if config.push_force:
-                push_cmd.append("--force-with-lease")
+                # Note: we use plain --force (not --force-with-lease) because
+                # 'target' is a freshly-added remote with no remote-tracking
+                # ref yet, and --force-with-lease requires a ref to compare
+                # against. After clone we *know* nobody else just pushed,
+                # so plain force is fine here.
+                push_cmd.append("--force")
             push_cmd.extend(["target", f"HEAD:{branch}"])
             res = subprocess.run(push_cmd, cwd=str(work), capture_output=True, text=True)
             if res.returncode != 0:
