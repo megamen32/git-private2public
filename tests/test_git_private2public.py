@@ -97,7 +97,7 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.3"
+    assert g.__version__ == "0.1.4"
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -133,6 +133,127 @@ def test_gitpublic_secret_check_clean_when_only_safe_files_tracked(tmp_path: Pat
     subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/"])
 
     assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == []
+
+
+# ---- guard / default-pattern tests ----------------------------------------- #
+
+def test_load_scan_rules_includes_defaults_when_requested(tmp_path: Path):
+    """load_scan_rules(include_defaults=True) returns DEFAULT_SECRET_PATTERNS
+    first, then any user-defined rules from .gitpublic/scan."""
+    scan = tmp_path / ".gitpublic" / "scan"
+    scan.parent.mkdir()
+    scan.write_text("# comment\nregex:my-private-token-\\d+\n")
+    rules = g.load_scan_rules(str(tmp_path), include_defaults=True)
+    assert g.DEFAULT_SECRET_PATTERNS[0] in rules
+    assert "regex:my-private-token-\\d+" in rules
+
+
+def test_load_scan_rules_without_defaults_only_returns_custom(tmp_path: Path):
+    """load_scan_rules(include_defaults=False) returns only user rules.
+    publish() uses this; guard() uses include_defaults=True."""
+    scan = tmp_path / ".gitpublic" / "scan"
+    scan.parent.mkdir()
+    scan.write_text("regex:my-private-token-\\d+\n")
+    rules = g.load_scan_rules(str(tmp_path), include_defaults=False)
+    assert "regex:my-private-token-\\d+" in rules
+    # None of the defaults should leak through
+    for default in g.DEFAULT_SECRET_PATTERNS:
+        assert default not in rules
+
+
+def test_load_scan_rules_missing_file_returns_only_defaults(tmp_path: Path):
+    rules = g.load_scan_rules(str(tmp_path), include_defaults=True)
+    assert rules == g.DEFAULT_SECRET_PATTERNS
+
+
+def test_scan_local_repo_blocks_openai_key(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    (repo / "src.py").write_text('token = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCDEF"\n')
+    subprocess.run(["git", "-C", str(repo), "add", "src.py"])
+    violations = g.scan_local_repo(
+        repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[]
+    )
+    assert any("OpenAI project" in v or "sk-proj" in v for v in violations)
+
+
+def test_scan_local_repo_blocks_github_pat(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    (repo / "token.txt").write_text("ghp_abcdefghijklmnopqrstuvwxyz0123456789\n")
+    subprocess.run(["git", "-C", str(repo), "add", "token.txt"])
+    violations = g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[])
+    assert any("GitHub PAT" in v or "ghp_" in v for v in violations)
+
+
+def test_scan_local_repo_blocks_aws_access_key(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    (repo / "creds.env").write_text("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
+    subprocess.run(["git", "-C", str(repo), "add", "creds.env"])
+    violations = g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[])
+    assert any("AWS" in v or "AKIA" in v for v in violations)
+
+
+def test_scan_local_repo_clean_for_normal_source(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    (repo / "main.go").write_text('package main\nfunc main() { println("hello world") }\n')
+    (repo / "config.yaml").write_text("server:\n  port: 8080\n  name: app\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."])
+    assert g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[]) == []
+
+
+def test_scan_local_repo_respects_allow_domains(tmp_path: Path):
+    """If the matched text is in allow_domains, skip the violation."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    # AWS-shaped key in a config that also happens to mention an allowed domain.
+    # The match itself contains the secret, so allow_domains doesn't excuse it.
+    # But for a token whose value is the allowed domain — that should pass.
+    (repo / "ok.py").write_text('api_host = "api.example.com"\n')
+    (repo / "bad.py").write_text('api_key = "AKIAIOSFODNN7EXAMPLE"\n')
+    subprocess.run(["git", "-C", str(repo), "add", "."])
+    violations = g.scan_local_repo(
+        repo,
+        g.DEFAULT_SECRET_PATTERNS,
+        allow_domains=["example.com"],
+    )
+    assert any("bad.py" in v for v in violations)
+    assert not any("ok.py" in v for v in violations)
+
+
+def test_guard_hook_installs_and_runs(tmp_path: Path, monkeypatch):
+    """End-to-end: guard enable writes the hook, guard run on a repo with a
+    secret should fail, on a clean repo should pass."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"])
+    (repo / "config.py").write_text("secret = 'ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345'\n")
+    subprocess.run(["git", "-C", str(repo), "add", "config.py"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"])
+
+    # Pretend we're inside the repo
+    monkeypatch.chdir(repo)
+    rc = g.cmd_guard_run(argparse.Namespace())
+    assert rc == 1
+
+    # Now remove the secret and re-run
+    (repo / "config.py").write_text("debug = True\n")
+    subprocess.run(["git", "-C", str(repo), "add", "config.py"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "fix"])
+    rc = g.cmd_guard_run(argparse.Namespace())
+    assert rc == 0
+
+
+import argparse
 
 
 def test_validate_config_single_repo_falls_back_to_origin(tmp_path: Path, monkeypatch):

@@ -31,12 +31,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 try:
     import yaml
 except ImportError:
     sys.exit("Missing dependency: pip install pyyaml")
+
+
+# --------------------------------------------------------------------------- #
+# Default secret patterns
+# --------------------------------------------------------------------------- #
+# Always-on safety net applied by `guard` (and optionally by `publish`).
+# Catches the common offenders people accidentally commit: API keys for the
+# usual providers. Add custom patterns in .gitpublic/scan — they layer on top.
+
+DEFAULT_SECRET_PATTERNS: list[str] = [
+    "regex:sk-[A-Za-z0-9]{20,}",                        # OpenAI legacy
+    "regex:sk-proj-[A-Za-z0-9_-]{40,}",                 # OpenAI project
+    "regex:ghp_[A-Za-z0-9]{30,}",                       # GitHub PAT (classic)
+    "regex:github_pat_[A-Za-z0-9_]{30,}",               # GitHub fine-grained PAT
+    "regex:gho_[A-Za-z0-9]{30,}",                       # GitHub OAuth
+    "regex:ghs_[A-Za-z0-9]{30,}",                       # GitHub server token
+    "regex:ghr_[A-Za-z0-9]{30,}",                       # GitHub refresh token
+    "regex:hf_[A-Za-z0-9]{20,}",                        # HuggingFace
+    "regex:xox[baprs]-[A-Za-z0-9-]{10,}",               # Slack
+    "regex:AKIA[0-9A-Z]{16}",                           # AWS access key ID
+    "regex:AIza[0-9A-Za-z_-]{35}",                      # Google API key
+    "regex:ya29\\.[0-9A-Za-z_-]{20,}",                  # Google OAuth refresh
+    "regex:glpat-[A-Za-z0-9_-]{20,}",                   # GitLab PAT
+    "regex:eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+",  # JWT (catch-all)
+    "regex:-----BEGIN [A-Z ]*PRIVATE KEY-----",         # PEM private key header
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -311,6 +337,28 @@ def check_local_gitpublic_secrets_not_tracked(cwd: str) -> list[str]:
     tracked = {f for f in res.stdout.splitlines() if f}
     secret_files = {f".gitpublic/{name}" for name in GITPUBLIC_SECRET_FILES}
     return sorted(tracked & secret_files)
+
+
+def load_scan_rules(cwd: str, include_defaults: bool = False) -> list[str]:
+    """Return scan rules: defaults + custom from .gitpublic/scan.
+
+    With include_defaults=True (used by `guard`), the canonical set of
+    provider API-key patterns is prepended to whatever the user added in
+    .gitpublic/scan. With False (legacy publish behaviour), only the
+    user's rules are returned.
+    """
+    custom: list[str] = []
+    scan_file = Path(cwd) / ".gitpublic" / "scan"
+    if scan_file.exists():
+        for line in scan_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                custom.append(line)
+    if include_defaults:
+        # Defaults first so the user can override duplicate patterns by
+        # placing their own copy later in .gitpublic/scan.
+        return list(DEFAULT_SECRET_PATTERNS) + custom
+    return custom
 
 
 def make_filter_repo_args(deletes: list[DeleteRule], replaces_path: Path) -> list[str]:
@@ -607,6 +655,163 @@ def find_git_root(start: Path) -> Path | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Guard — pre-push safety net
+# --------------------------------------------------------------------------- #
+# guard installs a lightweight pre-push hook that blocks `git push` if
+# scanned content matches DEFAULT_SECRET_PATTERNS or .gitpublic/scan rules.
+# Unlike `hook` (which also rewrites history and pushes to a public repo),
+# guard is purely a refusal mechanism — no clone, no filter-repo, no push.
+
+GUARD_HOOK_MARKER = "# git-private2public guard hook"
+
+
+def scan_local_repo(repo: Path, rules: list[str], allow_domains: list[str]) -> list[str]:
+    """Scan tracked files in `repo` against `rules`. Returns violations."""
+    allow_re = re.compile(b"|".join(re.escape(d.encode()) for d in allow_domains)) if allow_domains else None
+    compiled: list[tuple[str, "re.Pattern[bytes]"]] = []
+    for raw in rules:
+        s = raw.strip()
+        if s.startswith("regex:"):
+            compiled.append((raw, re.compile(s[len("regex:"):].encode())))
+        else:
+            compiled.append((raw, re.compile(re.escape(s.encode()))))
+
+    res = subprocess.run(["git", "ls-files"], cwd=str(repo), capture_output=True, text=True)
+    files = [f for f in res.stdout.strip().split("\n") if f]
+
+    violations: list[str] = []
+    for fpath in files:
+        full = repo / fpath
+        if not full.is_file():
+            continue
+        try:
+            data = full.read_bytes()
+        except Exception:
+            continue
+        # Heuristic: skip very large binary-ish files
+        if len(data) > 1_500_000:
+            continue
+        for raw, pat in compiled:
+            for m in pat.finditer(data):
+                matched = m.group(0)
+                if allow_re and allow_re.search(matched):
+                    continue
+                line = data[:m.start()].count(b"\n") + 1
+                snippet = matched.decode("utf-8", "replace")[:40]
+                violations.append(f"{fpath}:{line}: matches '{raw}' \u2192 {snippet!r}")
+    return violations
+
+
+def cmd_guard_run(args) -> int:
+    """Scan the local repo. Used by the guard pre-push hook."""
+    cwd = os.getcwd()
+    repo = find_git_root(Path(cwd))
+    if not repo:
+        sys.exit("Not inside a git repo.")
+    rules = load_scan_rules(str(repo), include_defaults=True)
+    if not rules:
+        print("no scan rules — skipping", file=sys.stderr)
+        return 0
+    # Allowlist: anything in .gitpublic/allow — these domains are OK
+    allow: list[str] = []
+    allow_file = repo / ".gitpublic" / "allow"
+    if allow_file.exists():
+        allow = [line.strip() for line in allow_file.read_text().splitlines()
+                 if line.strip() and not line.strip().startswith("#")]
+
+    violations = scan_local_repo(repo, rules, allow)
+    if violations:
+        print(f"\u2717 guard: refusing push \u2014 {len(violations)} potential secret(s):",
+              file=sys.stderr)
+        for v in violations[:30]:
+            print(f"  {v}", file=sys.stderr)
+        if len(violations) > 30:
+            print(f"  ... and {len(violations) - 30} more", file=sys.stderr)
+        print("\nFix: remove the secret, rotate it if it's live, then re-push.",
+              file=sys.stderr)
+        print("Bypass (NOT recommended):  GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_guard(args) -> int:
+    """Install / remove / show the local git pre-push guard hook."""
+    if args.action == "run":
+        return cmd_guard_run(args)
+
+    repo_root = find_git_root(Path.cwd())
+    if not repo_root:
+        sys.exit("Not inside a git repo.")
+
+    hook_dir = repo_root / ".git" / "hooks"
+    hook_path = hook_dir / "pre-push"
+
+    if args.action == "enable":
+        # If a regular `hook` (publish) is already installed, leave it alone —
+        # the user asked for guard-only. Both would race on the same hook file.
+        if hook_path.exists() and "git-private2public hook" in hook_path.read_text() \
+                and GUARD_HOOK_MARKER not in hook_path.read_text():
+            sys.exit(
+                f"{hook_path} is already a git-private2public 'hook' (publish). "
+                "Disable it first with `git-private2public hook disable` if you "
+                "want to switch to guard-only. Or run guard enable AFTER hook "
+                "disable if you want both behaviours — but they share the hook "
+                "file so you'll need to combine them manually."
+            )
+        hook_dir.mkdir(parents=True, exist_ok=True)
+        if hook_path.exists() and GUARD_HOOK_MARKER not in hook_path.read_text() \
+                and "git-private2public" not in hook_path.read_text():
+            sys.exit(f"{hook_path} exists and is not managed by git-private2public; refusing to overwrite")
+        tool = str(Path(__file__).resolve())
+        hook_content = f"""#!/bin/sh
+{GUARD_HOOK_MARKER}
+# Auto-generated by: {tool}
+# Runs `git-private2public guard run` before `git push` goes out.
+# Blocks the push if scanned content matches DEFAULT_SECRET_PATTERNS
+# (sk-, ghp_, hf_, AWS, etc.) or .gitpublic/scan rules.
+# To disable: `git-private2public guard disable`  (or delete this file)
+if [ "$GIT_PRIVATE2PUBLIC_SKIP_GUARD" = "1" ]; then
+    exit 0
+fi
+exec python3 "{tool}" guard run
+"""
+        hook_path.write_text(hook_content)
+        hook_path.chmod(0o755)
+        print(f"\u2713 Guard installed: {hook_path}")
+        print(f"  Every `git push` will now be scanned against the default")
+        print(f"  secret patterns plus your .gitpublic/scan rules.")
+        print(f"  Disable: git-private2public guard disable")
+        print(f"  Bypass once: GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push")
+        return 0
+
+    if args.action == "disable":
+        if hook_path.exists():
+            content = hook_path.read_text()
+            if GUARD_HOOK_MARKER in content:
+                hook_path.unlink()
+                print(f"\u2713 Guard removed: {hook_path}")
+                print(f"  `git push` will no longer be auto-scanned.")
+            else:
+                print(f"  {hook_path} exists but is not ours — leaving it alone.")
+                return 1
+        else:
+            print(f"  No hook at {hook_path} — nothing to remove.")
+        return 0
+
+    if args.action == "status":
+        if hook_path.exists() and GUARD_HOOK_MARKER in hook_path.read_text():
+            print(f"\u2713 Guard is ENABLED: {hook_path}")
+            print(f"  Default patterns: {len(DEFAULT_SECRET_PATTERNS)}")
+        else:
+            print(f"\u2717 Guard is disabled (no guard hook at {hook_path}).")
+            print(f"  Enable: git-private2public guard enable")
+        return 0
+
+    return 1
+
+
 # Files written by `init` into .gitpublic/
 GITPUBLIC_FILES = {
     "config": """# Required: which repos to sync
@@ -709,6 +914,20 @@ def main() -> int:
     p_hook_sub.add_parser("status", help="show whether the hook is on or off")
     p_hook.add_argument("-c", "--config", default=".gitpublic")
     p_hook.set_defaults(func=cmd_hook)
+
+    p_guard = sub.add_parser(
+        "guard", help="pre-push safety net: scan for secrets, refuse push if found"
+    )
+    p_guard_sub = p_guard.add_subparsers(dest="action", required=True)
+    p_guard_sub.add_parser("enable", help="install the guard pre-push hook")
+    p_guard_sub.add_parser("disable", help="remove the guard hook")
+    p_guard_sub.add_parser("status", help="show whether the guard is on or off")
+    p_guard_sub.add_parser(
+        "run",
+        help="scan the local repo against default + custom rules (used by the hook itself; "
+             "also useful manually: `git-private2public guard run`)",
+    )
+    p_guard.set_defaults(func=cmd_guard)
 
     args = p.parse_args()
     return args.func(args)
