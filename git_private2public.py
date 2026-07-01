@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 try:
     import yaml
@@ -287,6 +287,32 @@ def clone_source(source: str, dest: Path) -> None:
     # filter-repo works on bare clones too; keep it simple.
 
 
+# Files inside .gitpublic/ that may carry literal secrets in their content
+# (replace patterns or scan rules) and therefore must never be committed.
+GITPUBLIC_SECRET_FILES = ("replace", "scan")
+
+
+def check_local_gitpublic_secrets_not_tracked(cwd: str) -> list[str]:
+    """Refuse to publish if .gitpublic/{replace,scan} is tracked in the local repo.
+
+    Only ``replace`` and ``scan`` may contain literal secrets (e.g.
+    ``whisper.bezrabotnyi.com==>example.com`` or ``XYZ123`` as a scan
+    pattern). The other files in .gitpublic/ — ``config``, ``ignore``,
+    ``allow`` — are safe to commit.
+
+    Returns the list of tracked secret-bearing files. Empty list = OK.
+    """
+    res = subprocess.run(
+        ["git", "-C", cwd, "ls-files", "-c", "--", ".gitpublic/"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return []
+    tracked = {f for f in res.stdout.splitlines() if f}
+    secret_files = {f".gitpublic/{name}" for name in GITPUBLIC_SECRET_FILES}
+    return sorted(tracked & secret_files)
+
+
 def make_filter_repo_args(deletes: list[DeleteRule], replaces_path: Path) -> list[str]:
     args: list[str] = []
     for d in deletes:
@@ -368,6 +394,30 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> int:
+    cwd = cwd or os.getcwd()
+
+    # Only .gitpublic/{replace,scan} may carry literal secrets; the rest
+    # (config / ignore / allow) is safe to commit. Refuse early if those
+    # two files accidentally landed in the local repo's index.
+    tracked_secrets = check_local_gitpublic_secrets_not_tracked(cwd)
+    if tracked_secrets:
+        sys.stderr.write(
+            "\u2717 secret-bearing .gitpublic/ files are tracked in your local repo "
+            "\u2014 refusing to publish.\n"
+            "  These files may hold literal secrets inside replace/scan rules;\n"
+            "  pushing them would leak them to the public repo.\n"
+        )
+        for f in tracked_secrets:
+            sys.stderr.write(f"  {f}\n")
+        sys.stderr.write(
+            "\n  Fix (keep config/ignore/allow public, hide only replace/scan):\n"
+            "    echo '.gitpublic/replace' >> .gitignore\n"
+            "    echo '.gitpublic/scan'    >> .gitignore\n"
+            "    git rm --cached .gitpublic/replace .gitpublic/scan\n"
+            "    git commit -m 'untrack .gitpublic/{replace,scan}'\n"
+        )
+        return 1
+
     validate_config(config, cwd=cwd)
     deletes = [DeleteRule.parse(d) for d in config.delete]
     replaces = [ReplaceRule.parse(r) for r in config.replace]

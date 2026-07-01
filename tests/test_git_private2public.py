@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -96,7 +97,42 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.2"
+    assert g.__version__ == "0.1.3"
+
+
+def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
+    """Only .gitpublic/replace and .gitpublic/scan are flagged.
+
+    .gitpublic/config / .gitpublic/ignore / .gitpublic/allow are safe
+    to commit and must NOT show up in the result.
+    """
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "config").write_text("source = a\ntarget = b\n")
+    (gp / "ignore").write_text(".env\n")
+    (gp / "allow").write_text("github.com\n")
+    (gp / "replace").write_text("whisper.bezrabotnyi.com==>example.com\n")
+    (gp / "scan").write_text("XYZ123\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/"])
+
+    flagged = g.check_local_gitpublic_secrets_not_tracked(str(repo))
+    assert flagged == [".gitpublic/replace", ".gitpublic/scan"]
+
+
+def test_gitpublic_secret_check_clean_when_only_safe_files_tracked(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "config").write_text("source = a\ntarget = b\n")
+    (gp / "ignore").write_text(".env\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/"])
+
+    assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == []
 
 
 def test_validate_config_single_repo_falls_back_to_origin(tmp_path: Path, monkeypatch):
