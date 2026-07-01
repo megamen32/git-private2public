@@ -53,6 +53,63 @@ git-private2public hook disable    # выкл
 
 Нативный git-хук. Без CI, без GitHub Actions. Работает офлайн.
 
+## Guard — предохранитель на pre-push
+
+`guard` ставит лёгкий pre-push хук, который **блокирует** `git push`, если в
+сканируемом контенте матчатся известные паттерны секретов. В отличие от
+`hook` (который ещё и переписывает историю и force-пушит публичное
+зеркало), `guard` — чисто отказ: без clone, без filter-repo, без push.
+
+```bash
+git-private2public guard enable    # поставить pre-push хук
+git-private2public guard status    # стоит?
+git-private2public guard disable   # снять
+git-private2public guard run       # ручное сканирование (это же делает хук)
+```
+
+**Что сканируется по умолчанию:**
+1. Каждый отслеживаемый файл в рабочем дереве (`git ls-files`).
+2. **Каждый blob в git-истории** — ловит секреты, закоммиченные в старых
+   коммитах, а потом удалённые из HEAD, но не вытертые через filter-repo.
+   Чтобы пропустить этот шаг (быстрее, но не ловит старые утечки):
+   `git-private2public guard run --no-history`.
+
+**Дефолтные паттерны секретов (всегда включены, `.gitpublic/` не нужен):**
+- OpenAI: `sk-...`, `sk-proj-...`
+- GitHub: `ghp_...`, `github_pat_...`, `gho_...`, `ghs_...`, `ghr_...`
+- HuggingFace: `hf_...`
+- Slack: `xox[baprs]-...`
+- AWS access key IDs: `AKIA...`
+- Google API keys: `AIza...`, `ya29.*`
+- GitLab PAT: `glpat-...`
+- Универсальный JWT: `eyJ...?...?...`
+- Заголовки PEM private-key: `-----BEGIN ... PRIVATE KEY-----`
+
+**Свои паттерны** — кладёшь в `.gitpublic/scan`, по строке (литерал или
+`regex:...`). Они дополняют дефолтные.
+
+**Allowlist** — всё, что в `.gitpublic/allow`, считается исключением для
+широких regex-правил, которые могут зацепить публичный домен.
+
+**Одноразовый bypass (не рекомендуется):**
+
+```bash
+GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push
+```
+
+Если нужен только `guard` (без `hook`/publish) — `guard enable` работает
+сам по себе. Они делят один pre-push файл, поэтому `guard enable`
+откажется, если уже стоит `hook`; сними один, прежде чем ставить другой.
+
+### Зачем сканировать историю?
+
+Секрет ушёл в коммит месяц назад, потом его убрали из HEAD — но объект
+коммита всё ещё лежит в `.git/objects/`. Push HEAD его не отдаст напрямую,
+но любой, у кого уже есть репо, увидит его через `git log -p`. История-
+скан в guard это ловит. Чтобы **реально стереть** из истории — запусти
+`git-private2public publish` (использует filter-repo) или
+`git filter-repo --replace-text` руками.
+
 ## Папка `.gitpublic/`
 
 Каждый файл — одна забота. Как `.gitignore` — одно правило на строку, `#` для
@@ -102,6 +159,7 @@ init        создать .gitpublic/ конфиг
 scan        почистить во временный репозиторий, проверить, не пушить
 publish     вычистить + запушить
 hook        enable / disable / status
+guard       enable / disable / status / run  (pre-push сканер секретов)
 ```
 
 ## Как работает `allow` / domains
@@ -160,12 +218,13 @@ pip install git-private2public
 В Git нет «приватного файла в публичном репо». Поэтому нужно два репо. Эта
 тулза держит их в синке — без утечек.
 
-| | удалить файлы | заменить текст | скан | авто пуш |
-|---|:---:|:---:|:---:|:---:|
-| git-filter-repo | ✅ | ✅ | ❌ | ❌ |
-| BFG | ✅ | ✅ | ❌ | ❌ |
-| dupligit | ❌ | ❌ | ❌ | ✅ |
-| **git-private2public** | ✅ | ✅ | ✅ | ✅ |
+| | удалить файлы | заменить текст | скан | авто пуш | pre-push guard |
+|---|:---:|:---:|:---:|:---:|:---:|
+| git-filter-repo | ✅ | ✅ | ❌ | ❌ | ❌ |
+| BFG | ✅ | ✅ | ❌ | ❌ | ❌ |
+| dupligit | ❌ | ❌ | ❌ | ✅ | ❌ |
+| gitleaks / trufflehog | ❌ | ❌ | ✅ | ❌ | ✅ (отдельная тулза) |
+| **git-private2public** | ✅ | ✅ | ✅ | ✅ | ✅ (встроен) |
 
 ## Лицензия
 

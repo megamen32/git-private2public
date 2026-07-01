@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 try:
     import yaml
@@ -703,6 +703,146 @@ def scan_local_repo(repo: Path, rules: list[str], allow_domains: list[str]) -> l
     return violations
 
 
+# Cap on blob size for history scan; anything bigger is almost certainly a binary
+# artefact (compiled assets, dataset snapshots, etc.) and is unlikely to contain
+# a credential. Configurable via env GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES.
+DEFAULT_MAX_BLOB_BYTES = 1_500_000
+
+
+def _compile_rules(rules: list[str]) -> list[tuple[str, "re.Pattern[bytes]"]]:
+    compiled: list[tuple[str, "re.Pattern[bytes]"]] = []
+    for raw in rules:
+        s = raw.strip()
+        if s.startswith("regex:"):
+            compiled.append((raw, re.compile(s[len("regex:"):].encode())))
+        else:
+            compiled.append((raw, re.compile(re.escape(s.encode()))))
+    return compiled
+
+
+def _scan_bytes(data: bytes, fpath: str, compiled, allow_re) -> list[str]:
+    """Apply all compiled rules to a single blob; return violations."""
+    violations: list[str] = []
+    for raw, pat in compiled:
+        for m in pat.finditer(data):
+            matched = m.group(0)
+            if allow_re and allow_re.search(matched):
+                continue
+            line = data[:m.start()].count(b"\n") + 1
+            snippet = matched.decode("utf-8", "replace")[:40]
+            violations.append(f"{fpath}:{line}: matches '{raw}' \u2192 {snippet!r}")
+    return violations
+
+
+def scan_history(repo: Path, rules: list[str], allow_domains: list[str]) -> list[str]:
+    """Scan every blob reachable from any ref.
+
+    Uses ``git cat-file --batch-all-objects`` (git 2.30+) to enumerate every
+    blob in the object database and reads them in a single batch call. This
+    catches secrets that already live in old commits but were never removed
+    via filter-repo. Each blob is scanned only once even if it appears in
+    many commits (the object store already deduplicates).
+
+    Blobs larger than DEFAULT_MAX_BLOB_BYTES are skipped — they're almost
+    always binary artefacts where regex scanning would produce noise.
+    """
+    if not rules:
+        return []
+    allow_re = re.compile(b"|".join(re.escape(d.encode()) for d in allow_domains)) if allow_domains else None
+    compiled = _compile_rules(rules)
+    max_blob = int(os.environ.get("GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES", DEFAULT_MAX_BLOB_BYTES))
+
+    # 1) Enumerate every blob reachable from any object in the repo.
+    enum = subprocess.run(
+        ["git", "cat-file", "--batch-check", "--batch-all-objects",
+         "--format=%(objectname) %(objecttype) %(objectsize)"],
+        cwd=str(repo), capture_output=True, text=True,
+    )
+    if enum.returncode != 0:
+        # Older git without --batch-all-objects: fall back to rev-list.
+        rev = subprocess.run(
+            ["git", "rev-list", "--all", "--objects"],
+            cwd=str(repo), capture_output=True, text=True,
+        )
+        candidates = []
+        for line in rev.stdout.splitlines():
+            sha = line.split(maxsplit=1)[0]
+            candidates.append(sha)
+        # Probe each to filter blobs. This is slower but works everywhere.
+        blob_shas: list[str] = []
+        if candidates:
+            probe_input = "\n".join(candidates).encode() + b"\n"
+            probe = subprocess.run(
+                ["git", "cat-file", "--batch-check"],
+                cwd=str(repo), input=probe_input, capture_output=True,
+            )
+            for line in probe.stdout.decode("utf-8", "replace").splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "blob":
+                    try:
+                        if int(parts[2]) <= max_blob:
+                            blob_shas.append(parts[0])
+                    except ValueError:
+                        pass
+    else:
+        blob_shas = []
+        for line in enum.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == "blob":
+                try:
+                    if int(parts[2]) <= max_blob:
+                        blob_shas.append(parts[0])
+                except ValueError:
+                    pass
+
+    if not blob_shas:
+        return []
+
+    # 2) Read every blob in one batch call.
+    proc = subprocess.Popen(
+        ["git", "cat-file", "--batch"],
+        cwd=str(repo), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, _ = proc.communicate(
+            ("\n".join(blob_shas) + "\n").encode(),
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return []
+
+    # 3) Parse "<sha> <type> <size>\n<content>" records and scan each.
+    violations: list[str] = []
+    pos = 0
+    while pos < len(stdout):
+        # Header line ends at first newline.
+        nl = stdout.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = stdout[pos:nl].decode("ascii", "replace")
+        parts = header.split()
+        if len(parts) < 3 or parts[1] != "blob":
+            # Skip non-blob or malformed; advance to next line.
+            pos = nl + 1
+            continue
+        try:
+            size = int(parts[2])
+        except ValueError:
+            pos = nl + 1
+            continue
+        content_start = nl + 1
+        content_end = content_start + size
+        data = stdout[content_start:content_end]
+        # Format: <sha> <type> <size>\n<content> — no trailing newline guaranteed,
+        # but git always emits content bytes followed by next record's header.
+        for v in _scan_bytes(data, f"<history:{parts[0][:12]}>", compiled, allow_re):
+            violations.append(v)
+        pos = content_end
+
+    return violations
+
+
 def cmd_guard_run(args) -> int:
     """Scan the local repo. Used by the guard pre-push hook."""
     cwd = os.getcwd()
@@ -721,6 +861,10 @@ def cmd_guard_run(args) -> int:
                  if line.strip() and not line.strip().startswith("#")]
 
     violations = scan_local_repo(repo, rules, allow)
+    if getattr(args, "history", True):
+        history_violations = scan_history(repo, rules, allow)
+        violations.extend(history_violations)
+
     if violations:
         print(f"\u2717 guard: refusing push \u2014 {len(violations)} potential secret(s):",
               file=sys.stderr)
@@ -731,6 +875,8 @@ def cmd_guard_run(args) -> int:
         print("\nFix: remove the secret, rotate it if it's live, then re-push.",
               file=sys.stderr)
         print("Bypass (NOT recommended):  GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push",
+              file=sys.stderr)
+        print("Skip history only (NOT recommended):  --no-history",
               file=sys.stderr)
         return 1
     return 0
@@ -922,10 +1068,18 @@ def main() -> int:
     p_guard_sub.add_parser("enable", help="install the guard pre-push hook")
     p_guard_sub.add_parser("disable", help="remove the guard hook")
     p_guard_sub.add_parser("status", help="show whether the guard is on or off")
-    p_guard_sub.add_parser(
+    p_guard_run_p = p_guard_sub.add_parser(
         "run",
         help="scan the local repo against default + custom rules (used by the hook itself; "
              "also useful manually: `git-private2public guard run`)",
+    )
+    p_guard_run_p.add_argument(
+        "--history", dest="history", action="store_true", default=True,
+        help="scan every blob in git history, not just the working tree (default: on)",
+    )
+    p_guard_run_p.add_argument(
+        "--no-history", dest="history", action="store_false",
+        help="scan only tracked files in the working tree, skip git history",
     )
     p_guard.set_defaults(func=cmd_guard)
 

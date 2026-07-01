@@ -53,6 +53,63 @@ git-private2public hook disable    # off
 
 Native git hook. No CI, no GitHub Actions. Works offline.
 
+## Guard — pre-push safety net
+
+`guard` installs a lightweight pre-push hook that **blocks** `git push` if
+scanned content matches known secret patterns. Unlike `hook` (which also
+rewrites history and force-pushes a public mirror), `guard` is purely a
+refusal mechanism — no clone, no filter-repo, no push.
+
+```bash
+git-private2public guard enable    # install pre-push hook
+git-private2public guard status    # is it on?
+git-private2public guard disable   # remove the hook
+git-private2public guard run       # manual scan (also what the hook does)
+```
+
+**What it scans — by default:**
+1. Every tracked file in the working tree (`git ls-files`).
+2. **Every blob in git history** — catches secrets committed in old commits
+   and later removed from HEAD but never rewritten via filter-repo.
+   Use `--no-history` to skip this (faster, but won't catch old leaks).
+
+**Default secret patterns (always on, no `.gitpublic/` required):**
+- OpenAI: `sk-...`, `sk-proj-...`
+- GitHub: `ghp_...`, `github_pat_...`, `gho_...`, `ghs_...`, `ghr_...`
+- HuggingFace: `hf_...`
+- Slack: `xox[baprs]-...`
+- AWS access key IDs: `AKIA...`
+- Google API keys: `AIza...`, `ya29.*`
+- GitLab PATs: `glpat-...`
+- Generic JWTs: `eyJ...?...?...`
+- PEM private-key headers: `-----BEGIN ... PRIVATE KEY-----`
+
+**Custom patterns:** drop them into `.gitpublic/scan`, one per line (literal
+or `regex:...`). They layer on top of the defaults.
+
+**Allowlist:** anything in `.gitpublic/allow` is treated as an exception for
+broad regex rules that happen to match a public domain.
+
+**Bypass for one push (NOT recommended):**
+
+```bash
+GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push
+```
+
+If you only want guard and not `hook` (publish) — `guard enable` works
+independently. They share the same pre-push file, so `guard enable` refuses
+to install if `hook` is already there; disable one before enabling the
+other.
+
+### Why scan history?
+
+A secret leaked into a commit last month, removed from HEAD yesterday, but
+the commit object still exists in `.git/objects/`. Pushing HEAD won't
+expose it directly, but anyone who already has the repo and runs
+`git log -p` will see it. Guard's history scan catches this. To actually
+*remove* it from history, run `git-private2public publish` (which uses
+filter-repo), or `git filter-repo --replace-text` manually.
+
 ## The `.gitpublic/` folder
 
 Each file is one concern. Like `.gitignore` — one rule per line, `#` for
@@ -102,6 +159,7 @@ init        create .gitpublic/ config
 scan        clean into a temp repo, scan, don't push
 publish     clean + push
 hook        enable / disable / status
+guard       enable / disable / status / run  (pre-push secret scanner)
 ```
 
 ## How `allow` / domains work
@@ -160,12 +218,13 @@ That's it. Now you have the `git-private2public` command.
 Git has no "private file in a public repo". So you need two repos. This keeps
 them in sync — without leaking.
 
-| | delete files | replace text | scan | auto push |
-|---|:---:|:---:|:---:|:---:|
-| git-filter-repo | ✅ | ✅ | ❌ | ❌ |
-| BFG | ✅ | ✅ | ❌ | ❌ |
-| dupligit | ❌ | ❌ | ❌ | ✅ |
-| **git-private2public** | ✅ | ✅ | ✅ | ✅ |
+| | delete files | replace text | scan | auto push | pre-push guard |
+|---|:---:|:---:|:---:|:---:|:---:|
+| git-filter-repo | ✅ | ✅ | ❌ | ❌ | ❌ |
+| BFG | ✅ | ✅ | ❌ | ❌ | ❌ |
+| dupligit | ❌ | ❌ | ❌ | ✅ | ❌ |
+| gitleaks / trufflehog | ❌ | ❌ | ✅ | ❌ | ✅ (separate tool) |
+| **git-private2public** | ✅ | ✅ | ✅ | ✅ | ✅ (built-in) |
 
 ## License
 

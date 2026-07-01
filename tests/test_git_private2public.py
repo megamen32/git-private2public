@@ -97,7 +97,7 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.4"
+    assert g.__version__ == "0.1.5"
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -240,17 +240,66 @@ def test_guard_hook_installs_and_runs(tmp_path: Path, monkeypatch):
     subprocess.run(["git", "-C", str(repo), "add", "config.py"])
     subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"])
 
-    # Pretend we're inside the repo
+    # Pretend we're inside the repo. Use --no-history here because this test
+    # focuses on the working-tree path; history scan is covered separately
+    # in test_scan_history_finds_old_blob.
     monkeypatch.chdir(repo)
-    rc = g.cmd_guard_run(argparse.Namespace())
+    rc = g.cmd_guard_run(argparse.Namespace(history=False))
     assert rc == 1
 
     # Now remove the secret and re-run
     (repo / "config.py").write_text("debug = True\n")
     subprocess.run(["git", "-C", str(repo), "add", "config.py"])
     subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "fix"])
-    rc = g.cmd_guard_run(argparse.Namespace())
+    rc = g.cmd_guard_run(argparse.Namespace(history=False))
     assert rc == 0
+
+
+def test_scan_history_finds_old_blob(tmp_path: Path):
+    """A secret committed in an old commit and then removed in a later commit
+    must still be caught by the history scan — that's the whole point of
+    scanning history."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"])
+    (repo / "creds.txt").write_text("OPENAI_KEY=sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ01234567890XYZ\n")
+    subprocess.run(["git", "-C", str(repo), "add", "creds.txt"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "initial"])
+    # Remove the secret in a follow-up commit.
+    (repo / "creds.txt").write_text("# credentials moved to vault\n")
+    subprocess.run(["git", "-C", str(repo), "add", "creds.txt"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "move to vault"])
+
+    violations = g.scan_history(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[])
+    assert any("sk-proj" in v for v in violations), \
+        f"history scan missed the old blob: {violations}"
+
+
+def test_scan_history_skips_oversized_blobs(tmp_path: Path, monkeypatch):
+    """Blobs larger than DEFAULT_MAX_BLOB_BYTES are skipped — they're almost
+    always binary assets where regex would only produce noise."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    monkeypatch.setenv("GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES", "10")
+    (repo / "big.bin").write_bytes(b"x" * 4096)
+    subprocess.run(["git", "-C", str(repo), "add", "big.bin"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "big"])
+    # Even if the blob contained a fake "secret", with size cap = 10 bytes
+    # nothing is read or scanned. Verify scan returns [] for the empty rules:
+    violations = g.scan_history(repo, rules=[], allow_domains=[])
+    assert violations == []
+
+
+def test_scan_history_empty_rules_returns_empty(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    assert g.scan_history(repo, rules=[], allow_domains=[]) == []
 
 
 import argparse
