@@ -97,7 +97,7 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.5"
+    assert g.__version__ == "0.1.6"
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -330,6 +330,57 @@ def test_validate_config_mirror_mode_fills_missing_side():
     cfg = g.Config(source="git@github.com:me/priv.git", target="")
     g.validate_config(cfg)
     assert cfg.target == "git@github.com:me/priv.git"
+
+
+def test_guard_run_message_mentions_publish_for_history(tmp_path: Path, monkeypatch, capsys):
+    """When a violation lives only in git history, the error message must
+    point the user at `git-private2public publish` or `git filter-repo`."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"])
+    (repo / "creds.txt").write_text("OPENAI_KEY=sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ01234567890XYZ\n")
+    subprocess.run(["git", "-C", str(repo), "add", "creds.txt"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "leak"])
+    # Now overwrite the working-tree file so the leak lives only in history.
+    (repo / "creds.txt").write_text("# moved to vault\n")
+    subprocess.run(["git", "-C", str(repo), "add", "creds.txt"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "fix"])
+
+    monkeypatch.chdir(repo)
+    rc = g.cmd_guard_run(argparse.Namespace(history=True))
+    out = capsys.readouterr().err
+    assert rc == 1
+    assert "git-private2public publish" in out
+    assert "filter-repo" in out
+    # Working-tree section must NOT appear (no live leak in HEAD).
+    assert "Working-tree secrets" not in out
+
+
+def test_guard_run_message_mentions_working_tree_fix(tmp_path: Path, monkeypatch, capsys):
+    """When a violation is in the working tree, the message must point at
+    the file and the simple edits / gitignore / git rm --cached path —
+    not at history rewriting."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"])
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"])
+    (repo / "config.py").write_text("debug = True\n")
+    subprocess.run(["git", "-C", str(repo), "add", "config.py"])
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"])
+    # Live leak in the working tree (not yet committed).
+    (repo / "config.py").write_text("token = 'ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345'\n")
+
+    monkeypatch.chdir(repo)
+    rc = g.cmd_guard_run(argparse.Namespace(history=False))
+    out = capsys.readouterr().err
+    assert rc == 1
+    assert "Working-tree secrets" in out
+    assert "git rm --cached" in out
+    # History section should NOT show because we ran --no-history.
+    assert "git-private2public publish" not in out
 
 
 import subprocess as _sp

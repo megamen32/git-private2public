@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 try:
     import yaml
@@ -861,19 +861,54 @@ def cmd_guard_run(args) -> int:
                  if line.strip() and not line.strip().startswith("#")]
 
     violations = scan_local_repo(repo, rules, allow)
+    history_violations: list[str] = []
     if getattr(args, "history", True):
         history_violations = scan_history(repo, rules, allow)
         violations.extend(history_violations)
 
     if violations:
+        n_tree = len(violations) - len(history_violations)
+        n_hist = len(history_violations)
         print(f"\u2717 guard: refusing push \u2014 {len(violations)} potential secret(s):",
               file=sys.stderr)
+        if n_tree and n_hist:
+            print(f"  ({n_tree} in working tree, {n_hist} in git history)",
+                  file=sys.stderr)
         for v in violations[:30]:
             print(f"  {v}", file=sys.stderr)
         if len(violations) > 30:
             print(f"  ... and {len(violations) - 30} more", file=sys.stderr)
-        print("\nFix: remove the secret, rotate it if it's live, then re-push.",
-              file=sys.stderr)
+
+        # Tailored remediation hints.
+        print(file=sys.stderr)
+        if n_tree:
+            print("Working-tree secrets \u2014 fix in the source files:",
+                  file=sys.stderr)
+            print("  - edit the file, replace the secret with a placeholder",
+                  file=sys.stderr)
+            print("  - if the file shouldn't be tracked at all, add it to .gitignore",
+                  file=sys.stderr)
+            print("    and `git rm --cached <path>`", file=sys.stderr)
+            print("  - if the secret is live, ROTATE it first, then commit",
+                  file=sys.stderr)
+        if n_hist:
+            print("History secrets \u2014 the commit object is still in .git/objects/.",
+                  file=sys.stderr)
+            print("  Editing the file is not enough; you need to rewrite history.",
+                  file=sys.stderr)
+            print("  Easiest path (if you have a .gitpublic/ config set up):",
+                  file=sys.stderr)
+            print("    git-private2public publish", file=sys.stderr)
+            print("  Manual path (works without .gitpublic/):",
+                  file=sys.stderr)
+            print("    git filter-repo --replace-text replacements.txt --force",
+                  file=sys.stderr)
+            print("  where replacements.txt has one '<secret>==><replacement>' per line.",
+                  file=sys.stderr)
+            print("  Note: rewriting history requires force-push and will break",
+                  file=sys.stderr)
+            print("  any clones \u2014 coordinate with collaborators first.",
+                  file=sys.stderr)
         print("Bypass (NOT recommended):  GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push",
               file=sys.stderr)
         print("Skip history only (NOT recommended):  --no-history",

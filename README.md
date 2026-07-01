@@ -96,6 +96,21 @@ broad regex rules that happen to match a public domain.
 GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push
 ```
 
+**What guard tells you when it refuses the push:**
+
+The error message is tailored to where the secret lives:
+
+- **In the working tree** — points at the file, suggests editing,
+  `.gitignore` + `git rm --cached`, and reminds you to rotate a live
+  secret before committing.
+- **In git history** — explains that editing HEAD isn't enough, and
+  prints the exact next step:
+  - `git-private2public publish` (if you have a `.gitpublic/` set up), or
+  - `git filter-repo --replace-text replacements.txt --force` (manual),
+    with the `replacements.txt` format.
+
+When both happen, you get both sections.
+
 If you only want guard and not `hook` (publish) — `guard enable` works
 independently. They share the same pre-push file, so `guard enable` refuses
 to install if `hook` is already there; disable one before enabling the
