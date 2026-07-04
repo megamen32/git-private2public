@@ -29,6 +29,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import Iterable
 
 __version__ = "0.1.7"
@@ -441,6 +442,59 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
 # Publish flow
 # --------------------------------------------------------------------------- #
 
+
+def _backup_gitdir(source: str, cwd: str) -> str | None:
+    """Create a timestamped backup of the source gitdir before filter-repo.
+    Backups: ~/.cache/git-private2public/backups/<source>/<ts>/
+    Keeps max 5 backups per source. Returns path or None.
+    """
+    cache_dir = Path.home() / ".cache" / "git-private2public" / "backups"
+    try:
+        src_path = Path(source).expanduser().resolve()
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(src_path))
+        backup_root = cache_dir / safe_name
+        backup_root.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_root / ts
+        gitdir = src_path / ".git"
+        if gitdir.is_file():
+            ref = gitdir.read_text().strip()
+            gitdir = Path(ref.split(":", 1)[-1].strip()).expanduser().resolve()
+        if not gitdir.exists():
+            msg = "ℹ No gitdir found at {} -- skipping backup.".format(gitdir)
+            print(msg, file=sys.stderr); return None
+        msg = "ℹ Backing up gitdir ({}) to {} ...".format(gitdir, backup_path)
+        print(msg, file=sys.stderr)
+        shutil.copytree(gitdir, backup_path, symlinks=True)
+        backups = sorted(b for b in backup_root.iterdir() if b.is_dir())
+        for old in backups[:-5]:
+            shutil.rmtree(old)
+            print("✓ Rotated out old backup " + old.name, file=sys.stderr)
+        return str(backup_path)
+    except Exception as ex:
+        print("⚠ Backup failed (continuing anyway): " + str(ex), file=sys.stderr)
+        return None
+
+def _break_alternates(work_gitdir: Path) -> bool:
+    """Break object-store alternates so filter-repo cannot corrupt source.
+    git clone --no-local shares objects; filter-repo rewrites in-place.
+    """
+    alt_file = work_gitdir / "info" / "alternates"
+    if not alt_file.exists(): return False
+    alt_path = alt_file.read_text().strip()
+    if not alt_path: return False
+    print("ℹ Breaking object-store alternates (was: " + alt_path + ") ...", file=sys.stderr)
+    work_objects = work_gitdir / "objects"
+    local_objects = work_gitdir / "objects-local"
+    shutil.copytree(work_objects, local_objects, symlinks=False, dirs_exist_ok=True)
+    shutil.rmtree(work_objects)
+    local_objects.rename(work_objects)
+    alt_file.unlink()
+    for sub in ["info", "refs"]:
+        subp = work_gitdir / sub
+        if subp.exists(): shutil.rmtree(subp, ignore_errors=True)
+    return True
+
 def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> int:
     cwd = cwd or os.getcwd()
 
@@ -475,8 +529,14 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
         work = tmp_path / "work"
 
         source_url = expand_github_shorthand(config.source)
+
+        # Backup source gitdir before any destructive rewrite
+        backup_path = _backup_gitdir(config.source, cwd)
         print(f"▸ Cloning {mask_url(source_url)} ...", file=sys.stderr)
         run(["git", "clone", "--no-local", source_url, str(work)])
+
+        # Break object-store alternates so filter-repo cannot corrupt source
+        _break_alternates(work / ".git")
 
         # Detach origin (filter-repo removes it anyway)
         run(["git", "remote", "remove", "origin"], cwd=str(work), check=False)
@@ -500,7 +560,10 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
             res = subprocess.run(cmd, cwd=str(work), capture_output=True, text=True)
             if res.returncode != 0:
                 sys.stderr.write(res.stderr)
-                sys.exit(f"git-filter-repo failed (rc={res.returncode})")
+                bk = ("\n  Backup available at: " + backup_path) if backup_path else ""
+                restore = ("\n  Run: rsync -a " + backup_path + "/. /home/roomhacker/gptadmin/.git/ to restore") if backup_path else ""
+                sys.stderr.write(res.stderr)
+                sys.exit("git-filter-repo failed (rc=" + str(res.returncode) + ")" + bk + restore)
 
         # Scan the result
         print("▸ Scanning result for secrets / private data ...", file=sys.stderr)
@@ -553,7 +616,12 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
             if res.returncode != 0:
                 sys.stderr.write(res.stderr)
 
-        print(f"✓ Done. {config.target} updated.", file=sys.stderr)
+        if backup_path:
+            msg = "✓ Done. {} updated.  | Backup: {}".format(config.target, backup_path)
+            print(msg, file=sys.stderr)
+        else:
+            msg = "✓ Done. {} updated.".format(config.target)
+            print(msg, file=sys.stderr)
         return 0
 
 
