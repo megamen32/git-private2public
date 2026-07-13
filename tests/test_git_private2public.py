@@ -74,7 +74,9 @@ def test_allow_domains_are_bytes_safe(tmp_path: Path, monkeypatch: pytest.Monkey
     violations = g.scan_tree(repo, cfg)
 
     assert len(violations) == 1
-    assert "private.example.local" in violations[0]
+    assert "private.example.local" not in violations[0]
+    assert "len=" in violations[0]
+    assert "sha256=" in violations[0]
 
 
 def test_github_shorthand_expansion_and_masking():
@@ -463,3 +465,40 @@ def test_extended_default_patterns_avoid_common_false_positives(tmp_path: Path, 
     subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
 
     assert g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[]) == []
+
+
+def test_redacted_report_never_contains_secret():
+    secret = b"ghp_" + b"A" * 32 + b"1b2C"
+    report = g.format_violation("config.env", 7, g.DEFAULT_SECRET_PATTERNS[3], secret)
+    assert secret.decode() not in report
+    assert "ghp_…1b2C" in report
+    assert "len=40" in report
+    assert "sha256=" in report
+    assert "config.env:7" in report
+    assert "GitHub" in report
+
+
+@pytest.mark.parametrize(
+    ("secret", "hint"),
+    [
+        (b"sk-ant-" + b"A" * 20 + b"9XyZ", "sk-ant-…9XyZ"),
+        (b"123456789:" + b"A" * 30 + b"7QwE", "123…:…7QwE"),
+        (b"AKIA" + b"A" * 12 + b"4RtY", "AKIA…4RtY"),
+    ],
+)
+def test_redacted_report_has_rotation_friendly_hint(secret: bytes, hint: str):
+    rendered = g.redact_match(secret)
+    assert hint in rendered
+    assert secret.decode() not in rendered
+
+
+def test_doctor_reports_missing_tools_and_config(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(g.shutil, "which", lambda name: None)
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **kw: subprocess_completed(returncode=1))
+    rc = g.cmd_doctor(argparse.Namespace(config=".gitpublic"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "git-filter-repo" in out
+    assert "not inside a git repository" in out
+    assert "Doctor:" in out
