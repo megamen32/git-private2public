@@ -15,8 +15,9 @@ tool keeps them in sync. Automatically.
 
 ## Project philosophy
 
-**Nothing to learn before it becomes useful.** Install it, run `init`, then use
-`scan` to check and `publish` to publish. The safe behavior is the default; the
+**Nothing to learn before it becomes useful.** Install it and run
+`git-private2public` inside any Git repository: it immediately scans tracked
+files and history with built-in rules. No `init` or config is required for protection. The safe behavior is the default; the
 common path does not require memorizing flags, building pipelines, or learning
 Git internals.
 
@@ -36,7 +37,15 @@ In practice:
 
 ```bash
 pip install git-private2public
-git-private2public init          # creates .gitpublic/ folder
+git-private2public              # scans now; can enable pre-push protection
+```
+
+That already works with no config. `git-private2public scan` does the same scan explicitly.
+
+Only publishing needs setup, because the tool must know where the public copy lives:
+
+```bash
+git-private2public init
 ```
 
 Edit `.gitpublic/config` — set source + target. Values can be `owner/repo`, a full Git URL, or a local path:
@@ -129,10 +138,9 @@ The error message is tailored to where the secret lives:
 
 When both happen, you get both sections.
 
-If you only want guard and not `hook` (publish) — `guard enable` works
-independently. They share the same pre-push file, so `guard enable` refuses
-to install if `hook` is already there; disable one before enabling the
-other.
+If you only want guard and not auto-publish, the zero-config prompt or
+`guard enable` is enough. Guard and auto-publish can coexist; an existing
+user pre-push hook is preserved and chained automatically.
 
 ### Why scan history?
 

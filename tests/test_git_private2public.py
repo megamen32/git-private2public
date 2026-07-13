@@ -536,3 +536,50 @@ def test_doctor_reports_missing_tools_and_config(tmp_path: Path, monkeypatch, ca
     assert "git-filter-repo" in out
     assert "not inside a git repository" in out
     assert "Doctor:" in out
+
+
+def test_scan_without_config_uses_builtin_guard(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "safe.txt").write_text("hello\n")
+    subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
+    monkeypatch.chdir(repo)
+    assert g.cmd_scan(argparse.Namespace(config=".gitpublic", format="text")) == 0
+
+
+def test_scan_without_config_detects_secret(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "token.txt").write_text("ghp_" + "A" * 36 + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "token.txt"], check=True)
+    monkeypatch.chdir(repo)
+    assert g.cmd_scan(argparse.Namespace(config=".gitpublic", format="text")) == 1
+
+
+def test_default_command_scans_and_does_not_prompt_noninteractive(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "safe.txt").write_text("safe\n")
+    subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: False)
+    assert g.cmd_default(argparse.Namespace()) == 0
+    assert not (repo / ".git" / "hooks" / "pre-push").exists()
+
+
+def test_interactive_default_can_enable_guard(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+    g._interactive_offer_guard()
+    hook = repo / ".git" / "hooks" / "pre-push"
+    assert hook.exists()
+    assert "guard run" in hook.read_text()
