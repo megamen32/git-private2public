@@ -97,7 +97,7 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.7"
+    assert g.__version__ == "0.1.8"
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -415,3 +415,51 @@ def test_publish_uses_plain_force_not_force_with_lease():
     code = _re.sub(r"#[^\n]*\n", "", src)
     assert '"--force"' in code or "'--force'" in code
     assert "force-with-lease" not in code
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-ant-" + "api03-" + "A" * 32,
+        "ASIA" + "A" * 16,
+        "123456789:" + "A" * 35,
+        "npm_" + "A" * 36,
+        "pypi-" + "A" * 48,
+        "sk_" + "live_" + "A" * 24,
+        "rk_" + "test_" + "A" * 24,
+        "SG." + "A" * 16 + "." + "B" * 20,
+        "MTA" + "A" * 24 + "." + "B" * 6 + "." + "C" * 24,
+        "SK" + "0123456789abcdef" * 2,
+        "key-" + "0123456789abcdef" * 2,
+        "dop_v1_" + "A" * 64,
+    ],
+)
+def test_extended_default_patterns_detect_provider_credentials(tmp_path: Path, secret: str):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "credential.txt").write_text(secret + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "credential.txt"], check=True)
+
+    violations = g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[])
+    assert violations, f"expected built-in guard to detect {secret[:12]}…"
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "accessToken: string",
+        "clientSecret?: string",
+        "sha1-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "0123456789abcdef0123456789abcdef01234567",
+        "example npm token: npm_your_token_here",
+        "Telegram token format: <bot-id>:<token>",
+    ],
+)
+def test_extended_default_patterns_avoid_common_false_positives(tmp_path: Path, safe_text: str):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "safe.txt").write_text(safe_text + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
+
+    assert g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[]) == []

@@ -32,7 +32,7 @@ from pathlib import Path
 import time
 from typing import Iterable
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 try:
     import yaml
@@ -50,6 +50,7 @@ except ImportError:
 DEFAULT_SECRET_PATTERNS: list[str] = [
     "regex:sk-[A-Za-z0-9]{20,}",                        # OpenAI legacy
     "regex:sk-proj-[A-Za-z0-9_-]{40,}",                 # OpenAI project
+    "regex:sk-ant-[A-Za-z0-9_-]{20,}",                  # Anthropic
     "regex:ghp_[A-Za-z0-9]{30,}",                       # GitHub PAT (classic)
     "regex:github_pat_[A-Za-z0-9_]{30,}",               # GitHub fine-grained PAT
     "regex:gho_[A-Za-z0-9]{30,}",                       # GitHub OAuth
@@ -57,10 +58,20 @@ DEFAULT_SECRET_PATTERNS: list[str] = [
     "regex:ghr_[A-Za-z0-9]{30,}",                       # GitHub refresh token
     "regex:hf_[A-Za-z0-9]{20,}",                        # HuggingFace
     "regex:xox[baprs]-[A-Za-z0-9-]{10,}",               # Slack
-    "regex:AKIA[0-9A-Z]{16}",                           # AWS access key ID
+    "regex:AKIA[0-9A-Z]{16}",                           # AWS long-term access key ID
+    "regex:ASIA[0-9A-Z]{16}",                           # AWS temporary access key ID
     "regex:AIza[0-9A-Za-z_-]{35}",                      # Google API key
     "regex:ya29\\.[0-9A-Za-z_-]{20,}",                  # Google OAuth refresh
     "regex:glpat-[A-Za-z0-9_-]{20,}",                   # GitLab PAT
+    "regex:[0-9]{6,12}:[A-Za-z0-9_-]{30,50}",           # Telegram bot token
+    "regex:npm_[A-Za-z0-9]{30,}",                       # npm access token
+    "regex:pypi-[A-Za-z0-9_-]{40,}",                    # PyPI API token
+    "regex:(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",   # Stripe secret/restricted key
+    r"regex:SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}", # SendGrid API key
+    r"regex:(?:MTA|MTE|MTI|MTM|MTQ|MTU|MTY|MTc|MTg|MTk)[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}",  # Discord bot token
+    "regex:SK[0-9a-fA-F]{32}",                          # Twilio API key
+    "regex:key-[0-9a-zA-Z]{32}",                        # Mailgun private API key
+    "regex:dop_v1_[A-Za-z0-9]{64}",                    # DigitalOcean personal access token
     "regex:eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+",  # JWT (catch-all)
     "regex:-----BEGIN [A-Z ]*PRIVATE KEY-----",         # PEM private key header
 ]

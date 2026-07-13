@@ -74,15 +74,14 @@ git-private2public guard run       # manual scan (also what the hook does)
    Use `--no-history` to skip this (faster, but won't catch old leaks).
 
 **Default secret patterns (always on, no `.gitpublic/` required):**
-- OpenAI: `sk-...`, `sk-proj-...`
+- OpenAI and Anthropic: `sk-...`, `sk-proj-...`, `sk-ant-...`
 - GitHub: `ghp_...`, `github_pat_...`, `gho_...`, `ghs_...`, `ghr_...`
-- HuggingFace: `hf_...`
-- Slack: `xox[baprs]-...`
-- AWS access key IDs: `AKIA...`
-- Google API keys: `AIza...`, `ya29.*`
-- GitLab PATs: `glpat-...`
-- Generic JWTs: `eyJ...?...?...`
-- PEM private-key headers: `-----BEGIN ... PRIVATE KEY-----`
+- HuggingFace and Slack: `hf_...`, `xox[baprs]-...`
+- AWS long-term and temporary access key IDs: `AKIA...`, `ASIA...`
+- Google API/OAuth keys and GitLab PATs
+- Telegram bot, npm, PyPI, Stripe, SendGrid and Discord tokens
+- Twilio, Mailgun and DigitalOcean API credentials
+- Generic JWTs and PEM private-key headers
 
 **Custom patterns:** drop them into `.gitpublic/scan`, one per line (literal
 or `regex:...`). They layer on top of the defaults.
