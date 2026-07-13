@@ -13,6 +13,25 @@ Need the full rule-by-rule explanation? Read [Advanced configuration](./docs/ADV
 You have a private repo. You want a public one — without the secrets. This
 tool keeps them in sync. Automatically.
 
+## Project philosophy
+
+**Nothing to learn before it becomes useful.** Install it, run `init`, then use
+`scan` to check and `publish` to publish. The safe behavior is the default; the
+common path does not require memorizing flags, building pipelines, or learning
+Git internals.
+
+The same tool remains flexible when a project grows: `.gitpublic` lets you tune
+ignored files, replacements, allow-lists, branches, tags, hooks, CI output and
+remote layout without replacing the simple workflow.
+
+In practice:
+
+- easy to start;
+- safe by default;
+- one obvious command per action;
+- useful without configuration expertise;
+- universal enough for advanced private → public workflows.
+
 ## Quick start
 
 ```bash
@@ -254,3 +273,18 @@ git-private2public doctor
 the pre-push hook, and source/target remote access. Secret findings are always
 redacted and shown as type + location + safe prefix/suffix hint + length + short SHA-256 fingerprint; the
 matched credential itself is never printed.
+
+### Safe publication transactions
+
+`publish` records the current target branch SHA before sanitizing and uses an
+explicit `--force-with-lease` tied to that SHA. If somebody updates the public
+branch while the private history is being cleaned, publication stops instead
+of overwriting their work. After a successful push, the remote SHA is verified.
+Targets under 100 MiB are cloned and scanned again automatically; larger repos
+skip the extra clone but still receive SHA verification. Existing tags are
+never force-overwritten.
+
+For CI, `scan`, `publish --scan`, and `guard run` support `--format json`.
+
+The managed pre-push dispatcher can run both guard and auto-publish while
+preserving and chaining an existing user hook.
