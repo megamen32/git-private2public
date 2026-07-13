@@ -13,6 +13,25 @@ Need the full rule-by-rule explanation? Read [Advanced configuration](./docs/ADV
 You have a private repo. You want a public one — without the secrets. This
 tool keeps them in sync. Automatically.
 
+## Project philosophy
+
+**Nothing to learn before it becomes useful.** Install it, run `init`, then use
+`scan` to check and `publish` to publish. The safe behavior is the default; the
+common path does not require memorizing flags, building pipelines, or learning
+Git internals.
+
+The same tool remains flexible when a project grows: `.gitpublic` lets you tune
+ignored files, replacements, allow-lists, branches, tags, hooks, CI output and
+remote layout without replacing the simple workflow.
+
+In practice:
+
+- easy to start;
+- safe by default;
+- one obvious command per action;
+- useful without configuration expertise;
+- universal enough for advanced private → public workflows.
+
 ## Quick start
 
 ```bash
