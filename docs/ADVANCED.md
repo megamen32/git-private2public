@@ -16,14 +16,14 @@ private repo
   -> push to public repo             (.gitpublic/config)
 ```
 
-Missing files mean “no rules for that step”. They do not enable hidden defaults.
+Missing custom files mean “no custom rules for that step”. Built-in credential detection remains active for zero-config scans and guard mode.
 
 | File | If present | If missing or empty |
 |------|------------|---------------------|
 | `.gitpublic/config` | Defines source, target, push settings | `source`/`target` are required, so publish cannot run |
 | `.gitpublic/ignore` | Removes matching files/paths from all published history | No files are removed |
 | `.gitpublic/replace` | Rewrites matching text in remaining files | No text is rewritten |
-| `.gitpublic/scan` | Fails if any scan pattern is still present after cleanup | Nothing is blocked by scan |
+| `.gitpublic/scan` | Adds custom blocking patterns | Built-in credential rules still protect zero-config scans and guard mode |
 | `.gitpublic/allow` | Exceptions for domain-like matches found by `scan` | No scan exceptions exist |
 | `.gitpublic/domains` | Same as `allow` alias | Nothing is allowlisted |
 
@@ -100,7 +100,7 @@ regex:.*\.corp\.internal ==> example.com
 
 ## `.gitpublic/scan`
 
-`scan` is the only thing that blocks a publish after cleanup.
+`.gitpublic/scan` adds custom blocking rules. Built-in credential rules are always available for zero-config scans and guard mode.
 
 One rule per line:
 
@@ -118,7 +118,7 @@ Forms:
 | `literal text` | fail if exact text remains |
 | `regex:pattern` | fail if regex matches |
 
-If `.gitpublic/scan` does not exist or has no active rules, nothing is blocked at this step.
+If `.gitpublic/scan` is missing, no custom rules are added. Built-in credential detection still works in zero-config scans and guard mode.
 
 ## Domains and `.gitpublic/allow`
 
@@ -214,7 +214,7 @@ Result:
 | Refuse publish if value survived | `scan` |
 | Make an exception for a public domain matched by broad domain scan | `allow` |
 | Auto-block every domain | add a broad domain regex to `scan` |
-| Auto-block secrets without rules | not supported; write `scan` rules or use external scanners before publishing |
+| Auto-block known credential formats | built in; no custom rule required |
 
 ## Hook mode
 
@@ -228,7 +228,7 @@ Installs a Git `pre-push` hook in the current private repo. On every `git push`,
 git-private2public publish -c .gitpublic
 ```
 
-If a non-`git-private2public` hook already exists, it refuses to overwrite it.
+Existing user hooks are preserved and chained. Guard and auto-publish can coexist in one managed dispatcher.
 
 ## YAML compatibility
 

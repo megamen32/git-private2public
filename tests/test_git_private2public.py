@@ -583,3 +583,35 @@ def test_interactive_default_can_enable_guard(tmp_path: Path, monkeypatch):
     hook = repo / ".git" / "hooks" / "pre-push"
     assert hook.exists()
     assert "guard run" in hook.read_text()
+
+
+def test_interactive_init_uses_origin_and_asks_only_for_public_target(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:alice/private.git"], check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: True)
+    answers = iter(["", "alice/public"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    rc = g.cmd_init(argparse.Namespace(path=".gitpublic", force=False))
+    config = (repo / ".gitpublic" / "config").read_text()
+
+    assert rc == 0
+    assert "source = git@github.com:alice/private.git" in config
+    assert "target = alice/public" in config
+
+
+def test_noninteractive_init_remains_deterministic(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: False)
+
+    rc = g.cmd_init(argparse.Namespace(path=".gitpublic", force=False))
+    config = (tmp_path / ".gitpublic" / "config").read_text()
+
+    assert rc == 0
+    assert "source = you/private-repo" in config
+    assert "target = you/public-repo" in config

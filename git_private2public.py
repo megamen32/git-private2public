@@ -1296,6 +1296,27 @@ def cmd_doctor(args) -> int:
     return 1 if failed else 0
 
 
+def _detect_source_remote() -> str:
+    repo = find_git_root(Path.cwd())
+    if not repo:
+        return str(Path.cwd())
+    res = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True)
+    return res.stdout.strip() if res.returncode == 0 and res.stdout.strip() else str(repo)
+
+
+def _interactive_init_values() -> tuple[str, str] | None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    detected = _detect_source_remote()
+    print("Setting up private → public publishing. Press Enter to accept a suggestion.")
+    source = input(f"Private source [{mask_url(detected)}]: ").strip() or detected
+    target = input("Public target (owner/repo, Git URL, or local path): ").strip()
+    if not target:
+        print("No public target entered. Config was created with a placeholder; edit .gitpublic/config later.")
+        target = "you/public-repo"
+    return source, target
+
+
 def cmd_init(args) -> int:
     # Folder mode: .gitpublic/ with one file per concern (like .gitignore)
     folder = Path(args.path)
@@ -1313,13 +1334,15 @@ def cmd_init(args) -> int:
     folder.mkdir(parents=True, exist_ok=True)
     for name, content in GITPUBLIC_FILES.items():
         (folder / name).write_text(content)
-    print(f"✓ Created {folder}/ with:")
-    for name in GITPUBLIC_FILES:
-        print(f"    {name}")
-    print()
-    print(f"  Edit {folder}/config  — set source + target")
-    print(f"  Edit {folder}/ignore  — files to hide (like .gitignore)")
-    print(f"  Run: git-private2public publish")
+    values = _interactive_init_values()
+    if values:
+        source, target = values
+        config_text = GITPUBLIC_FILES["config"]
+        config_text = config_text.replace("you/private-repo", source, 1).replace("you/public-repo", target, 1)
+        (folder / "config").write_text(config_text)
+    print(f"✓ Setup created in {folder}/")
+    print("Next: git-private2public publish")
+    print("Optional: edit .gitpublic/ignore like .gitignore to hide extra files.")
     return 0
 
 
@@ -1386,32 +1409,32 @@ def cmd_scan(args) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="git-private2public",
-        description="Like .gitignore, but for what goes public. Folder-based config.",
+        description="Scan now, or publish a safe public copy. Run without arguments to start.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
-    p_init = sub.add_parser("init", help="write an example config")
+    p_init = sub.add_parser("init", help="set up private → public publishing")
     p_init.add_argument("path", nargs="?", default=".gitpublic")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
-    p_doctor = sub.add_parser("doctor", help="diagnose tools, config, hooks and remote access")
+    p_doctor = sub.add_parser("doctor", help="find setup or access problems")
     p_doctor.add_argument("-c", "--config", default=".gitpublic")
     p_doctor.set_defaults(func=cmd_doctor)
 
-    p_pub = sub.add_parser("publish", help="sanitize + push to target")
+    p_pub = sub.add_parser("publish", help="publish the cleaned public copy")
     p_pub.add_argument("-c", "--config", default=".gitpublic")
     p_pub.add_argument("--scan", action="store_true", help="scan only, don't push")
     p_pub.add_argument("--format", choices=("text", "json"), default="text", help="report format")
     p_pub.set_defaults(func=cmd_publish)
 
-    p_scan = sub.add_parser("scan", help="scan only (no push)")
+    p_scan = sub.add_parser("scan", help="check the repository without publishing")
     p_scan.add_argument("-c", "--config", default=".gitpublic")
     p_scan.add_argument("--format", choices=("text", "json"), default="text", help="report format")
     p_scan.set_defaults(func=cmd_scan)
 
-    p_hook = sub.add_parser("hook", help="enable/disable a local git pre-push hook")
+    p_hook = sub.add_parser("hook", help="advanced: auto-publish on git push")
     p_hook_sub = p_hook.add_subparsers(dest="action", required=True)
     p_hook_sub.add_parser("enable", help="install the pre-push hook (auto-publish on every git push)")
     p_hook_sub.add_parser("disable", help="remove the hook")
@@ -1420,7 +1443,7 @@ def main() -> int:
     p_hook.set_defaults(func=cmd_hook)
 
     p_guard = sub.add_parser(
-        "guard", help="pre-push safety net: scan for secrets, refuse push if found"
+        "guard", help="advanced: manage automatic pre-push checks"
     )
     p_guard_sub = p_guard.add_subparsers(dest="action", required=True)
     p_guard_sub.add_parser("enable", help="install the guard pre-push hook")
