@@ -891,7 +891,7 @@ def find_git_root(start: Path) -> Path | None:
     """Walk up from `start` to find the nearest .git directory."""
     p = start.resolve()
     while p != p.parent:
-        if (p / ".git").is_dir():
+        if (p / ".git").exists():
             return p
         p = p.parent
     return None
@@ -940,8 +940,7 @@ def scan_local_repo(repo: Path, rules: list[str], allow_domains: list[str]) -> l
                 if allow_re and allow_re.search(matched):
                     continue
                 line = data[:m.start()].count(b"\n") + 1
-                snippet = matched.decode("utf-8", "replace")[:40]
-                violations.append(f"{fpath}:{line}: matches '{raw}' \u2192 {snippet!r}")
+                violations.append(format_violation(fpath, line, raw, matched))
     return violations
 
 
@@ -971,8 +970,7 @@ def _scan_bytes(data: bytes, fpath: str, compiled, allow_re) -> list[str]:
             if allow_re and allow_re.search(matched):
                 continue
             line = data[:m.start()].count(b"\n") + 1
-            snippet = matched.decode("utf-8", "replace")[:40]
-            violations.append(f"{fpath}:{line}: matches '{raw}' \u2192 {snippet!r}")
+            violations.append(format_violation(fpath, line, raw, matched))
     return violations
 
 
@@ -1325,12 +1323,62 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _zero_config_scan(output_format: str = "text", history: bool = True) -> int:
+    """Scan current repository using built-in rules only; no init required."""
+    repo = find_git_root(Path.cwd())
+    if not repo:
+        sys.exit("Not inside a git repository. Open a project folder and run again.")
+    args = argparse.Namespace(history=history, format=output_format)
+    return cmd_guard_run(args)
+
+
+def _interactive_offer_guard() -> None:
+    """Offer persistent protection once, only in a real interactive terminal."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    repo = find_git_root(Path.cwd())
+    if not repo:
+        return
+    _, state_path, _ = _hook_paths(repo)
+    if "guard" in _load_hook_actions(state_path):
+        return
+    try:
+        answer = input("\nEnable automatic secret checks before every git push? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer in ("", "y", "yes"):
+        actions = _set_hook_action(repo, "guard", True)
+        print(f"✓ Guard enabled. Active pre-push actions: {', '.join(sorted(actions))}")
+    else:
+        print("Skipped. You can run `git-private2public guard enable` later.")
+
+
+def cmd_default(args) -> int:
+    """Useful zero-config behavior for a bare `git-private2public` invocation."""
+    print("git-private2public: zero-config secret scan", file=sys.stderr)
+    rc = _zero_config_scan(output_format="text", history=True)
+    if rc == 0:
+        _interactive_offer_guard()
+    return rc
+
+
 def cmd_publish(args) -> int:
+    config_path = Path(args.config)
+    if not config_path.exists():
+        sys.exit(
+            "Publishing needs one thing scanning does not: where the public copy lives.\n"
+            "Run `git-private2public init`, set source + target once, then publish.\n"
+            "Secret scanning already works without init: `git-private2public` or `git-private2public scan`."
+        )
     config = Config.load(args.config)
     return publish(config, scan_only=args.scan, cwd=os.getcwd(), output_format=args.format)
 
 
 def cmd_scan(args) -> int:
+    config_path = Path(args.config)
+    if not config_path.exists():
+        return _zero_config_scan(output_format=args.format, history=True)
     config = Config.load(args.config)
     return publish(config, scan_only=True, cwd=os.getcwd(), output_format=args.format)
 
@@ -1341,7 +1389,7 @@ def main() -> int:
         description="Like .gitignore, but for what goes public. Folder-based config.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
 
     p_init = sub.add_parser("init", help="write an example config")
     p_init.add_argument("path", nargs="?", default=".gitpublic")
@@ -1394,6 +1442,8 @@ def main() -> int:
     p_guard.set_defaults(func=cmd_guard)
 
     args = p.parse_args()
+    if not getattr(args, "cmd", None):
+        return cmd_default(args)
     return args.func(args)
 
 
