@@ -1,5 +1,6 @@
 from pathlib import Path
 import subprocess
+import json
 
 import pytest
 
@@ -307,6 +308,10 @@ def test_scan_history_empty_rules_returns_empty(tmp_path: Path):
 import argparse
 
 
+def subprocess_completed(stdout: str = "", returncode: int = 0):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
 def test_validate_config_single_repo_falls_back_to_origin(tmp_path: Path, monkeypatch):
     """When source and target are both empty, validate_config picks up the
     current repo's origin URL and uses it for both sides (single-repo mode)."""
@@ -385,38 +390,67 @@ def test_guard_run_message_mentions_working_tree_fix(tmp_path: Path, monkeypatch
     assert "git-private2public publish" not in out
 
 
-def test_publish_uses_plain_force_not_force_with_lease():
-    """Regressed once: --force-with-lease failed with 'stale info' because
-    the freshly-added target remote has no remote-tracking ref to compare
-    against. We must use plain --force."""
+def test_publish_uses_explicit_force_with_lease():
+    """Forced publication must be tied to the exact target SHA observed before rewrite."""
     import inspect
-    import re as _re
     src = inspect.getsource(g.publish)
-    # Drop comments so we only look at real code.
-    code = _re.sub(r"#[^\n]*\n", "", src)
-    assert '"--force"' in code or "'--force'" in code
-    assert "force-with-lease" not in code
+    assert "--force-with-lease=refs/heads/" in src
+    assert 'push_cmd.append("--force")' not in src
 
 
-import subprocess as _sp
+def test_remote_ref_sha_returns_empty_for_missing_ref(monkeypatch):
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **kw: subprocess_completed(stdout="", returncode=0))
+    assert g._remote_ref_sha("example", "refs/heads/main") == ""
 
 
-def subprocess_completed(stdout: str = "", returncode: int = 0) -> _sp.CompletedProcess:
-    return _sp.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+def test_remote_ref_sha_reads_exact_sha(monkeypatch):
+    sha = "a" * 40
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **kw: subprocess_completed(stdout=f"{sha}\trefs/heads/main\n", returncode=0))
+    assert g._remote_ref_sha("example", "refs/heads/main") == sha
 
 
-def test_publish_uses_plain_force_not_force_with_lease():
-    """Regressed to --force-with-lease once: that failed with 'stale info'
-    because the freshly-added 'target' remote has no remote-tracking ref
-    to compare against, so --force-with-lease refuses to push. We must
-    use plain --force after a clone we just performed ourselves."""
-    import inspect
-    import re as _re
-    src = inspect.getsource(g.publish)
-    # Drop comment lines so we only inspect real code, not prose.
-    code = _re.sub(r"#[^\n]*\n", "", src)
-    assert '"--force"' in code or "'--force'" in code
-    assert "force-with-lease" not in code
+def test_hook_dispatcher_preserves_foreign_hook_and_combines_actions(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    hook_dir = repo / ".git" / "hooks"
+    hook_dir.mkdir(parents=True, exist_ok=True)
+    hook = hook_dir / "pre-push"
+    hook.write_text("#!/bin/sh\necho original\n")
+    hook.chmod(0o755)
+    monkeypatch.chdir(repo)
+
+    g._set_hook_action(repo, "guard", True)
+    g._set_hook_action(repo, "publish", True, str(repo / ".gitpublic"))
+
+    content = hook.read_text()
+    assert g.HOOK_DISPATCHER_MARKER in content
+    assert "guard run" in content
+    assert "publish -c" in content
+    original = hook_dir / "pre-push.git-private2public-original"
+    assert original.exists()
+    assert "echo original" in original.read_text()
+
+    g._set_hook_action(repo, "guard", False)
+    g._set_hook_action(repo, "publish", False)
+    assert "echo original" in hook.read_text()
+    assert not original.exists()
+
+
+def test_guard_json_report_is_machine_readable(tmp_path: Path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "token.txt").write_text("ghp_" + "A" * 36 + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "token.txt"], check=True)
+    monkeypatch.chdir(repo)
+    rc = g.cmd_guard_run(argparse.Namespace(history=False, format="json"))
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["count"] >= 1
+    assert payload["findings"]
+
 
 @pytest.mark.parametrize(
     "secret",

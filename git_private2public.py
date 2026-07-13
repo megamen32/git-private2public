@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -513,7 +514,47 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def _backup_gitdir(source: str, cwd: str) -> str | None:
+def _source_gitdir(source: str) -> Path | None:
+    src_path = Path(source).expanduser().resolve()
+    gitdir = src_path / ".git"
+    if gitdir.is_file():
+        ref = gitdir.read_text().strip()
+        gitdir = Path(ref.split(":", 1)[-1].strip()).expanduser().resolve()
+    return gitdir if gitdir.exists() else None
+
+
+def _remote_ref_sha(url: str, ref: str) -> str:
+    res = subprocess.run(
+        ["git", "ls-remote", url, ref], capture_output=True, text=True, timeout=30
+    )
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout).strip()
+        raise SystemExit(f"cannot read target ref {ref}: {err}")
+    line = res.stdout.strip().splitlines()
+    return line[0].split()[0] if line else ""
+
+
+def _verify_remote_ref(url: str, ref: str, expected: str) -> None:
+    actual = _remote_ref_sha(url, ref)
+    if actual != expected:
+        raise SystemExit(
+            f"post-push verification failed for {ref}: expected {expected}, got {actual or '<missing>'}"
+        )
+    print(f"✓ Verified {ref} at {actual[:12]}", file=sys.stderr)
+
+
+def _repo_size_bytes(path: Path) -> int:
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _backup_gitdir(source: str, cwd: str) -> tuple[str, str] | None:
     """Create a timestamped backup of the source gitdir before filter-repo.
     Backups: ~/.cache/git-private2public/backups/<source>/<ts>/
     Keeps max 5 backups per source. Returns path or None.
@@ -526,11 +567,8 @@ def _backup_gitdir(source: str, cwd: str) -> str | None:
         backup_root.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         backup_path = backup_root / ts
-        gitdir = src_path / ".git"
-        if gitdir.is_file():
-            ref = gitdir.read_text().strip()
-            gitdir = Path(ref.split(":", 1)[-1].strip()).expanduser().resolve()
-        if not gitdir.exists():
+        gitdir = _source_gitdir(source)
+        if not gitdir:
             msg = "ℹ No gitdir found at {} -- skipping backup.".format(gitdir)
             print(msg, file=sys.stderr); return None
         msg = "ℹ Backing up gitdir ({}) to {} ...".format(gitdir, backup_path)
@@ -540,7 +578,7 @@ def _backup_gitdir(source: str, cwd: str) -> str | None:
         for old in backups[:-5]:
             shutil.rmtree(old)
             print("✓ Rotated out old backup " + old.name, file=sys.stderr)
-        return str(backup_path)
+        return str(backup_path), str(gitdir)
     except Exception as ex:
         print("⚠ Backup failed (continuing anyway): " + str(ex), file=sys.stderr)
         return None
@@ -565,7 +603,7 @@ def _break_alternates(work_gitdir: Path) -> bool:
         if subp.exists(): shutil.rmtree(subp, ignore_errors=True)
     return True
 
-def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> int:
+def publish(config: Config, scan_only: bool = False, cwd: str | None = None, output_format: str = "text") -> int:
     cwd = cwd or os.getcwd()
 
     # Only .gitpublic/{replace,scan} may carry literal secrets; the rest
@@ -599,9 +637,24 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
         work = tmp_path / "work"
 
         source_url = expand_github_shorthand(config.source)
+        target_url = expand_github_shorthand(config.target)
+
+        # Auth from env if provided. Never print the tokenized URL.
+        token = os.environ.get("GIT_PRIVATE2PUBLIC_TOKEN")
+        if token and "github.com" in target_url and target_url.startswith("https://"):
+            target_url = target_url.replace("https://", f"https://x-access-token:{token}@", 1)
+
+        # Capture the exact target state before any expensive rewriting. A later
+        # push is allowed only if the branch still has this SHA (or is still absent).
+        expected_target_refs = {
+            branch: _remote_ref_sha(target_url, f"refs/heads/{branch}")
+            for branch in config.push_branches
+        }
 
         # Backup source gitdir before any destructive rewrite
-        backup_path = _backup_gitdir(config.source, cwd)
+        backup_info = _backup_gitdir(config.source, cwd)
+        backup_path = backup_info[0] if backup_info else None
+        restore_gitdir = backup_info[1] if backup_info else None
         print(f"▸ Cloning {mask_url(source_url)} ...", file=sys.stderr)
         run(["git", "clone", "--no-local", source_url, str(work)])
 
@@ -647,44 +700,63 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
             print("\nRefusing to push. Fix the rules and retry.", file=sys.stderr)
             return 1
         print("✓ No violations found.", file=sys.stderr)
+        if output_format == "json":
+            print(json.dumps({"ok": True, "scope": "sanitized-tree", "count": 0, "findings": []}, ensure_ascii=False))
 
         if scan_only:
             print("▸ Scan-only mode — not pushing.", file=sys.stderr)
             return 0
 
         # Push to target
-        target_url = expand_github_shorthand(config.target)
-
-        # Auth from env if provided. Never print the tokenized URL.
-        token = os.environ.get("GIT_PRIVATE2PUBLIC_TOKEN")
-        if token and "github.com" in target_url and target_url.startswith("https://"):
-            target_url = target_url.replace("https://", f"https://x-access-token:{token}@", 1)
-
         print(f"▸ Pushing to {mask_url(target_url)} ...", file=sys.stderr)
         run(["git", "remote", "add", "target", target_url], cwd=str(work))
 
+        local_head = run(["git", "rev-parse", "HEAD"], cwd=str(work)).stdout.strip()
         for branch in config.push_branches:
             push_cmd = ["git", "push"]
             if config.push_force:
-                # Note: we use plain --force (not --force-with-lease) because
-                # 'target' is a freshly-added remote with no remote-tracking
-                # ref yet, and --force-with-lease requires a ref to compare
-                # against. After clone we *know* nobody else just pushed,
-                # so plain force is fine here.
-                push_cmd.append("--force")
-            push_cmd.extend(["target", f"HEAD:{branch}"])
+                expected = expected_target_refs[branch]
+                lease = f"--force-with-lease=refs/heads/{branch}:{expected}"
+                push_cmd.append(lease)
+            push_cmd.extend(["target", f"HEAD:refs/heads/{branch}"])
             res = subprocess.run(push_cmd, cwd=str(work), capture_output=True, text=True)
             if res.returncode != 0:
                 sys.stderr.write(res.stderr)
-                sys.exit(f"push of {branch} failed (rc={res.returncode})")
+                sys.exit(
+                    f"push of {branch} failed; target probably changed while sanitizing. "
+                    "Nothing was overwritten. Run publish again."
+                )
+            _verify_remote_ref(target_url, f"refs/heads/{branch}", local_head)
 
         if config.push_tags:
+            # Never force tags: signed/release tags may drive CI and must not be
+            # silently rewritten. Existing conflicting tags make publish fail.
             res = subprocess.run(
-                ["git", "push", "--force", "target", "--tags"],
+                ["git", "push", "target", "--tags"],
                 cwd=str(work), capture_output=True, text=True
             )
             if res.returncode != 0:
                 sys.stderr.write(res.stderr)
+                sys.exit("tag push failed; existing target tags were left unchanged")
+
+        # For small repositories, independently clone the published target and
+        # scan it again. Large repositories get cheap SHA verification above.
+        verify_limit = int(os.environ.get("GIT_PRIVATE2PUBLIC_VERIFY_MAX_BYTES", 100 * 1024 * 1024))
+        repo_size = _repo_size_bytes(work / ".git")
+        if repo_size <= verify_limit:
+            verify_repo = tmp_path / "verify-target"
+            print(f"▸ Re-cloning small target for independent verification ({repo_size // 1024 // 1024} MiB) ...", file=sys.stderr)
+            run(["git", "clone", "--no-local", target_url, str(verify_repo)])
+            verify_violations = scan_tree(verify_repo, config)
+            if verify_violations:
+                raise SystemExit("post-push target scan found violations")
+            print("✓ Published target independently re-scanned.", file=sys.stderr)
+        else:
+            print(
+                f"ℹ Target re-clone skipped ({repo_size // 1024 // 1024} MiB > "
+                f"{verify_limit // 1024 // 1024} MiB); remote SHA was verified.",
+                file=sys.stderr,
+            )
 
         if backup_path:
             msg = "✓ Done. {} updated.  | Backup: {}".format(config.target, backup_path)
@@ -727,66 +799,93 @@ push:
 """
 
 
+HOOK_DISPATCHER_MARKER = "# git-private2public managed pre-push dispatcher"
+
+
+def _hook_paths(repo_root: Path) -> tuple[Path, Path, Path]:
+    res = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=str(repo_root), capture_output=True, text=True, check=True)
+    hook_dir = Path(res.stdout.strip())
+    if not hook_dir.is_absolute():
+        hook_dir = (repo_root / hook_dir).resolve()
+    return (
+        hook_dir / "pre-push",
+        hook_dir / "pre-push.git-private2public.json",
+        hook_dir / "pre-push.git-private2public-original",
+    )
+
+
+def _load_hook_actions(state_path: Path) -> dict[str, str]:
+    if not state_path.exists():
+        return {}
+    try:
+        value = json.loads(state_path.read_text())
+        return {str(k): str(v) for k, v in value.items()}
+    except Exception:
+        return {}
+
+
+def _write_hook_dispatcher(repo_root: Path, actions: dict[str, str]) -> None:
+    hook_path, state_path, original_path = _hook_paths(repo_root)
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+    if hook_path.exists() and HOOK_DISPATCHER_MARKER not in hook_path.read_text(errors="replace"):
+        if original_path.exists():
+            raise SystemExit(f"cannot preserve existing hook: {original_path} already exists")
+        hook_path.rename(original_path)
+
+    if not actions:
+        state_path.unlink(missing_ok=True)
+        if hook_path.exists() and HOOK_DISPATCHER_MARKER in hook_path.read_text(errors="replace"):
+            hook_path.unlink()
+        if original_path.exists():
+            original_path.rename(hook_path)
+        return
+
+    state_path.write_text(json.dumps(actions, indent=2) + "\n")
+    tool = str(Path(__file__).resolve())
+    lines = ["#!/bin/sh", HOOK_DISPATCHER_MARKER, "set -e"]
+    if "guard" in actions:
+        lines += [
+            'if [ "${GIT_PRIVATE2PUBLIC_SKIP_GUARD:-0}" != "1" ]; then',
+            f'  python3 "{tool}" guard run',
+            "fi",
+        ]
+    if "publish" in actions:
+        lines.append(f'python3 "{tool}" publish -c "{actions["publish"]}"')
+    lines += [f'if [ -x "{original_path}" ]; then', f'  exec "{original_path}" "$@"', "fi", "exit 0"]
+    hook_path.write_text("\n".join(lines) + "\n")
+    hook_path.chmod(0o755)
+
+
+def _set_hook_action(repo_root: Path, action: str, enabled: bool, config: str = "") -> dict[str, str]:
+    _, state_path, _ = _hook_paths(repo_root)
+    actions = _load_hook_actions(state_path)
+    if enabled:
+        actions[action] = config or "enabled"
+    else:
+        actions.pop(action, None)
+    _write_hook_dispatcher(repo_root, actions)
+    return actions
+
+
 def cmd_hook(args) -> int:
-    """Install / remove / show the local git pre-push hook."""
+    """Enable/disable auto-publish without overwriting existing hooks."""
     repo_root = find_git_root(Path.cwd())
     if not repo_root:
         sys.exit("Not inside a git repo.")
-
-    hook_dir = repo_root / ".git" / "hooks"
-    hook_path = hook_dir / "pre-push"
-    marker = "# git-private2public hook"
-
     if args.action == "enable":
-        hook_dir.mkdir(parents=True, exist_ok=True)
-        if hook_path.exists() and marker not in hook_path.read_text():
-            sys.exit(f"{hook_path} exists and is not managed by git-private2public; refusing to overwrite")
-        # Resolve path to this tool + config
-        tool = str(Path(__file__).resolve())
-        cfg = str(Path(args.config).resolve())
-        hook_content = f"""#!/bin/sh
-{marker}
-# Auto-generated by: {tool}
-# Runs `git-private2public publish` before `git push` goes out.
-# To disable: `git-private2public hook disable`  (or delete this file)
-exec python3 "{tool}" publish -c "{cfg}"
-"""
-        hook_path.write_text(hook_content)
-        hook_path.chmod(0o755)
-        print(f"✓ Hook installed: {hook_path}")
-        print(f"  Every `git push` will now also publish your clean public mirror.")
-        print(f"  Config: {cfg}")
-        print(f"  Disable: git-private2public hook disable")
+        actions = _set_hook_action(repo_root, "publish", True, str(Path(args.config).resolve()))
+        print(f"✓ Auto-publish enabled. Active pre-push actions: {', '.join(sorted(actions))}")
         return 0
-
     if args.action == "disable":
-        if hook_path.exists():
-            content = hook_path.read_text()
-            if marker in content:
-                hook_path.unlink()
-                print(f"✓ Hook removed: {hook_path}")
-                print(f"  `git push` will no longer auto-publish. Run `git-private2public publish` manually.")
-            else:
-                print(f"  {hook_path} exists but is not ours — leaving it alone.")
-                return 1
-        else:
-            print(f"  No hook at {hook_path} — nothing to remove.")
+        actions = _set_hook_action(repo_root, "publish", False)
+        print(f"✓ Auto-publish disabled. Active pre-push actions: {', '.join(sorted(actions)) or 'none'}")
         return 0
-
-    if args.action == "status":
-        if hook_path.exists() and marker in hook_path.read_text():
-            print(f"✓ Hook is ENABLED: {hook_path}")
-            # Show the config it points to
-            for line in hook_path.read_text().splitlines():
-                if "-c" in line:
-                    print(f"  {line.strip()}")
-        else:
-            print(f"✗ Hook is disabled (no hook at {hook_path}).")
-            print(f"  Enable: git-private2public hook enable")
-        return 0
-
-    return 1
-
+    _, state_path, original_path = _hook_paths(repo_root)
+    actions = _load_hook_actions(state_path)
+    print(f"{'✓' if 'publish' in actions else '✗'} Auto-publish is {'enabled' if 'publish' in actions else 'disabled'}.")
+    if original_path.exists():
+        print(f"  Existing pre-push hook is preserved and chained: {original_path}")
+    return 0
 
 def find_git_root(start: Path) -> Path | None:
     """Walk up from `start` to find the nearest .git directory."""
@@ -1011,6 +1110,8 @@ def cmd_guard_run(args) -> int:
 
     if violations:
         n_tree = len(violations) - len(history_violations)
+        if getattr(args, "format", "text") == "json":
+            print(json.dumps({"ok": False, "count": len(violations), "working_tree": n_tree, "history": len(history_violations), "findings": violations}, ensure_ascii=False))
         n_hist = len(history_violations)
         print(f"\u2717 guard: refusing push \u2014 {len(violations)} potential secret(s):",
               file=sys.stderr)
@@ -1057,83 +1158,32 @@ def cmd_guard_run(args) -> int:
         print("Skip history only (NOT recommended):  --no-history",
               file=sys.stderr)
         return 1
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"ok": True, "count": 0, "working_tree": 0, "history": 0, "findings": []}, ensure_ascii=False))
     return 0
 
 
 def cmd_guard(args) -> int:
-    """Install / remove / show the local git pre-push guard hook."""
+    """Run or manage the local pre-push guard."""
     if args.action == "run":
         return cmd_guard_run(args)
-
     repo_root = find_git_root(Path.cwd())
     if not repo_root:
         sys.exit("Not inside a git repo.")
-
-    hook_dir = repo_root / ".git" / "hooks"
-    hook_path = hook_dir / "pre-push"
-
     if args.action == "enable":
-        # If a regular `hook` (publish) is already installed, leave it alone —
-        # the user asked for guard-only. Both would race on the same hook file.
-        if hook_path.exists() and "git-private2public hook" in hook_path.read_text() \
-                and GUARD_HOOK_MARKER not in hook_path.read_text():
-            sys.exit(
-                f"{hook_path} is already a git-private2public 'hook' (publish). "
-                "Disable it first with `git-private2public hook disable` if you "
-                "want to switch to guard-only. Or run guard enable AFTER hook "
-                "disable if you want both behaviours — but they share the hook "
-                "file so you'll need to combine them manually."
-            )
-        hook_dir.mkdir(parents=True, exist_ok=True)
-        if hook_path.exists() and GUARD_HOOK_MARKER not in hook_path.read_text() \
-                and "git-private2public" not in hook_path.read_text():
-            sys.exit(f"{hook_path} exists and is not managed by git-private2public; refusing to overwrite")
-        tool = str(Path(__file__).resolve())
-        hook_content = f"""#!/bin/sh
-{GUARD_HOOK_MARKER}
-# Auto-generated by: {tool}
-# Runs `git-private2public guard run` before `git push` goes out.
-# Blocks the push if scanned content matches DEFAULT_SECRET_PATTERNS
-# (sk-, ghp_, hf_, AWS, etc.) or .gitpublic/scan rules.
-# To disable: `git-private2public guard disable`  (or delete this file)
-if [ "$GIT_PRIVATE2PUBLIC_SKIP_GUARD" = "1" ]; then
-    exit 0
-fi
-exec python3 "{tool}" guard run
-"""
-        hook_path.write_text(hook_content)
-        hook_path.chmod(0o755)
-        print(f"\u2713 Guard installed: {hook_path}")
-        print(f"  Every `git push` will now be scanned against the default")
-        print(f"  secret patterns plus your .gitpublic/scan rules.")
-        print(f"  Disable: git-private2public guard disable")
-        print(f"  Bypass once: GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push")
+        actions = _set_hook_action(repo_root, "guard", True)
+        print(f"✓ Guard enabled. Active pre-push actions: {', '.join(sorted(actions))}")
         return 0
-
     if args.action == "disable":
-        if hook_path.exists():
-            content = hook_path.read_text()
-            if GUARD_HOOK_MARKER in content:
-                hook_path.unlink()
-                print(f"\u2713 Guard removed: {hook_path}")
-                print(f"  `git push` will no longer be auto-scanned.")
-            else:
-                print(f"  {hook_path} exists but is not ours — leaving it alone.")
-                return 1
-        else:
-            print(f"  No hook at {hook_path} — nothing to remove.")
+        actions = _set_hook_action(repo_root, "guard", False)
+        print(f"✓ Guard disabled. Active pre-push actions: {', '.join(sorted(actions)) or 'none'}")
         return 0
-
-    if args.action == "status":
-        if hook_path.exists() and GUARD_HOOK_MARKER in hook_path.read_text():
-            print(f"\u2713 Guard is ENABLED: {hook_path}")
-            print(f"  Default patterns: {len(DEFAULT_SECRET_PATTERNS)}")
-        else:
-            print(f"\u2717 Guard is disabled (no guard hook at {hook_path}).")
-            print(f"  Enable: git-private2public guard enable")
-        return 0
-
-    return 1
+    _, state_path, original_path = _hook_paths(repo_root)
+    actions = _load_hook_actions(state_path)
+    print(f"{'✓' if 'guard' in actions else '✗'} Guard is {'enabled' if 'guard' in actions else 'disabled'}.")
+    if original_path.exists():
+        print(f"  Existing pre-push hook is preserved and chained: {original_path}")
+    return 0
 
 
 # Files written by `init` into .gitpublic/
@@ -1277,12 +1327,12 @@ def cmd_init(args) -> int:
 
 def cmd_publish(args) -> int:
     config = Config.load(args.config)
-    return publish(config, scan_only=args.scan, cwd=os.getcwd())
+    return publish(config, scan_only=args.scan, cwd=os.getcwd(), output_format=args.format)
 
 
 def cmd_scan(args) -> int:
     config = Config.load(args.config)
-    return publish(config, scan_only=True, cwd=os.getcwd())
+    return publish(config, scan_only=True, cwd=os.getcwd(), output_format=args.format)
 
 
 def main() -> int:
@@ -1305,10 +1355,12 @@ def main() -> int:
     p_pub = sub.add_parser("publish", help="sanitize + push to target")
     p_pub.add_argument("-c", "--config", default=".gitpublic")
     p_pub.add_argument("--scan", action="store_true", help="scan only, don't push")
+    p_pub.add_argument("--format", choices=("text", "json"), default="text", help="report format")
     p_pub.set_defaults(func=cmd_publish)
 
     p_scan = sub.add_parser("scan", help="scan only (no push)")
     p_scan.add_argument("-c", "--config", default=".gitpublic")
+    p_scan.add_argument("--format", choices=("text", "json"), default="text", help="report format")
     p_scan.set_defaults(func=cmd_scan)
 
     p_hook = sub.add_parser("hook", help="enable/disable a local git pre-push hook")
