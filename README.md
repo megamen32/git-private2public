@@ -243,3 +243,14 @@ them in sync — without leaking.
 ## License
 
 MIT
+
+### Diagnose setup
+
+```bash
+git-private2public doctor
+```
+
+`doctor` checks Git, `git-filter-repo`, repository/config health, secret-rule files,
+the pre-push hook, and source/target remote access. Secret findings are always
+redacted and shown as type + location + safe prefix/suffix hint + length + short SHA-256 fingerprint; the
+matched credential itself is never printed.

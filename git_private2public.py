@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import os
 import re
 import shutil
@@ -405,6 +406,65 @@ def write_replace_file(path: Path, rules: list[ReplaceRule]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Redacted findings
+# --------------------------------------------------------------------------- #
+
+_PATTERN_LABELS = {
+    "sk-ant-": "Anthropic API key",
+    "sk-proj-": "OpenAI project key",
+    "sk-": "OpenAI API key",
+    "github_pat_": "GitHub fine-grained PAT",
+    "ghp_": "GitHub classic PAT",
+    "AKIA": "AWS access key",
+    "ASIA": "AWS temporary access key",
+    "npm_": "npm token",
+    "pypi-": "PyPI token",
+    r"SG\.": "SendGrid API key",
+    "dop_v1_": "DigitalOcean token",
+    "PRIVATE KEY": "private key",
+}
+
+
+def describe_pattern(raw: str) -> str:
+    for needle, label in _PATTERN_LABELS.items():
+        if needle in raw:
+            return label
+    return "credential-like value"
+
+
+def _safe_token_hint(matched: bytes) -> str:
+    """Return a rotation-friendly, non-secret preview such as ghp_…A1b2."""
+    text = matched.decode("utf-8", "replace")
+    if len(text) <= 8:
+        return "…"
+
+    known_prefixes = (
+        "github_pat_", "sk-proj-", "sk-ant-", "dop_v1_", "pypi-",
+        "glpat-", "npm_", "ghp_", "gho_", "ghs_", "ghr_", "hf_",
+        "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "AKIA", "ASIA",
+        "sk_live_", "sk_test_", "rk_live_", "rk_test_", "SG.", "key-",
+    )
+    prefix = next((p for p in known_prefixes if text.startswith(p)), "")
+    if not prefix:
+        if ":" in text and text.split(":", 1)[0].isdigit():
+            prefix = text.split(":", 1)[0][:3] + "…:"
+        elif text.startswith("-----BEGIN"):
+            prefix = "PRIVATE-KEY-"
+        else:
+            prefix = text[:3]
+    return f"{prefix}…{text[-4:]}"
+
+
+def redact_match(matched: bytes) -> str:
+    digest = hashlib.sha256(matched).hexdigest()[:12]
+    return f"[{_safe_token_hint(matched)} len={len(matched)} sha256={digest}]"
+
+
+def format_violation(location: str, line: int, raw: str, matched: bytes) -> str:
+    return f"{location}:{line}: {describe_pattern(raw)} — {redact_match(matched)}"
+
+
+# --------------------------------------------------------------------------- #
 # Scanning
 # --------------------------------------------------------------------------- #
 
@@ -444,8 +504,7 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
                     continue
                 # Find line number
                 line = data[:m.start()].count(b"\n") + 1
-                snippet = data[m.start():m.end() + 20].decode("utf-8", "replace")[:60]
-                violations.append(f"{fpath}:{line}: matches '{raw}' → ...{snippet}...")
+                violations.append(format_violation(fpath, line, raw, matched))
     return violations
 
 
@@ -1113,6 +1172,82 @@ secrets/
 }
 
 
+def _doctor_check(label: str, ok: bool, detail: str) -> bool:
+    icon = "✓" if ok else "✗"
+    print(f"{icon} {label}: {detail}")
+    return ok
+
+
+def _git_remote_access(url: str) -> tuple[bool, str]:
+    if not url:
+        return False, "not configured"
+    expanded = expand_github_shorthand(url)
+    res = subprocess.run(
+        ["git", "ls-remote", expanded, "HEAD"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if res.returncode == 0:
+        return True, mask_url(expanded)
+    err = (res.stderr or res.stdout).strip().splitlines()
+    return False, (err[-1] if err else "access failed")
+
+
+def cmd_doctor(args) -> int:
+    """Diagnose installation, repository, config, hooks and remote access."""
+    cwd = Path.cwd()
+    repo = find_git_root(cwd)
+    results: list[bool] = []
+
+    git_bin = shutil.which("git")
+    results.append(_doctor_check("git", bool(git_bin), git_bin or "not found"))
+    filter_bin = shutil.which("git-filter-repo")
+    if not filter_bin:
+        user_filter = Path.home() / ".local" / "bin" / "git-filter-repo"
+        if user_filter.is_file() and os.access(user_filter, os.X_OK):
+            filter_bin = str(user_filter)
+    if not filter_bin:
+        probe = subprocess.run(["git", "filter-repo", "--version"], capture_output=True, text=True)
+        filter_bin = "git filter-repo" if probe.returncode == 0 else None
+    results.append(_doctor_check("git-filter-repo", bool(filter_bin), filter_bin or "not found; pip install git-filter-repo"))
+    results.append(_doctor_check("repository", repo is not None, str(repo) if repo else "not inside a git repository"))
+
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = cwd / config_path
+    config_ok = config_path.exists()
+    results.append(_doctor_check("config", config_ok, str(config_path)))
+
+    cfg = None
+    if config_ok:
+        try:
+            cfg = Config.load(config_path)
+            validate_config(cfg, cwd=str(repo or cwd))
+            results.append(_doctor_check("config syntax", True, "valid"))
+        except BaseException as exc:
+            results.append(_doctor_check("config syntax", False, str(exc)))
+
+    if repo:
+        tracked = check_local_gitpublic_secrets_not_tracked(str(repo))
+        results.append(_doctor_check("secret rule files", not tracked, "untracked" if not tracked else ", ".join(tracked)))
+        hook = repo / ".git" / "hooks" / "pre-push"
+        if hook.exists():
+            text = hook.read_text(errors="replace")
+            kind = "guard" if GUARD_HOOK_MARKER in text else ("publish" if "git-private2public hook" in text else "foreign")
+            results.append(_doctor_check("pre-push hook", kind != "foreign", f"enabled ({kind})"))
+        else:
+            results.append(_doctor_check("pre-push hook", False, "disabled; run `git-private2public guard enable`"))
+
+    if cfg:
+        ok, detail = _git_remote_access(cfg.source)
+        results.append(_doctor_check("source access", ok, detail))
+        ok, detail = _git_remote_access(cfg.target)
+        results.append(_doctor_check("target access", ok, detail))
+
+    failed = len([x for x in results if not x])
+    print(f"\nDoctor: {len(results)-failed}/{len(results)} checks passed.")
+    return 1 if failed else 0
+
+
 def cmd_init(args) -> int:
     # Folder mode: .gitpublic/ with one file per concern (like .gitignore)
     folder = Path(args.path)
@@ -1162,6 +1297,10 @@ def main() -> int:
     p_init.add_argument("path", nargs="?", default=".gitpublic")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
+
+    p_doctor = sub.add_parser("doctor", help="diagnose tools, config, hooks and remote access")
+    p_doctor.add_argument("-c", "--config", default=".gitpublic")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_pub = sub.add_parser("publish", help="sanitize + push to target")
     p_pub.add_argument("-c", "--config", default=".gitpublic")
