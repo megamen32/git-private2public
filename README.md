@@ -254,3 +254,18 @@ git-private2public doctor
 the pre-push hook, and source/target remote access. Secret findings are always
 redacted and shown as type + location + safe prefix/suffix hint + length + short SHA-256 fingerprint; the
 matched credential itself is never printed.
+
+### Safe publication transactions
+
+`publish` records the current target branch SHA before sanitizing and uses an
+explicit `--force-with-lease` tied to that SHA. If somebody updates the public
+branch while the private history is being cleaned, publication stops instead
+of overwriting their work. After a successful push, the remote SHA is verified.
+Targets under 100 MiB are cloned and scanned again automatically; larger repos
+skip the extra clone but still receive SHA verification. Existing tags are
+never force-overwritten.
+
+For CI, `scan`, `publish --scan`, and `guard run` support `--format json`.
+
+The managed pre-push dispatcher can run both guard and auto-publish while
+preserving and chaining an existing user hook.
