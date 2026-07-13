@@ -75,15 +75,14 @@ git-private2public guard run       # ручное сканирование (эт
    `git-private2public guard run --no-history`.
 
 **Дефолтные паттерны секретов (всегда включены, `.gitpublic/` не нужен):**
-- OpenAI: `sk-...`, `sk-proj-...`
+- OpenAI и Anthropic: `sk-...`, `sk-proj-...`, `sk-ant-...`
 - GitHub: `ghp_...`, `github_pat_...`, `gho_...`, `ghs_...`, `ghr_...`
-- HuggingFace: `hf_...`
-- Slack: `xox[baprs]-...`
-- AWS access key IDs: `AKIA...`
-- Google API keys: `AIza...`, `ya29.*`
-- GitLab PAT: `glpat-...`
-- Универсальный JWT: `eyJ...?...?...`
-- Заголовки PEM private-key: `-----BEGIN ... PRIVATE KEY-----`
+- HuggingFace и Slack: `hf_...`, `xox[baprs]-...`
+- постоянные и временные ключи AWS: `AKIA...`, `ASIA...`
+- Google API/OAuth и GitLab PAT
+- токены Telegram Bot, npm, PyPI, Stripe, SendGrid и Discord
+- учётные данные Twilio, Mailgun и DigitalOcean
+- универсальные JWT и заголовки приватных PEM-ключей
 
 **Свои паттерны** — кладёшь в `.gitpublic/scan`, по строке (литерал или
 `regex:...`). Они дополняют дефолтные.
