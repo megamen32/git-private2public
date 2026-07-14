@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import json
+import os
 
 import pytest
 
@@ -114,8 +115,8 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.2.0"
-    assert 'version = "0.2.0"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    assert g.__version__ == "0.2.1"
+    assert 'version = "0.2.1"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -151,6 +152,46 @@ def test_gitpublic_secret_check_clean_when_only_safe_files_tracked(tmp_path: Pat
     subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/"])
 
     assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == []
+
+
+def test_gitpublic_secret_check_allows_tracked_generic_regex_scan(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "scan").write_text(
+        "# Generic provider signatures are safe policy\n"
+        "regex:ghp_[A-Za-z0-9]{30,}\n"
+        "regex:AKIA[0-9A-Z]{16}\n"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/scan"], check=True)
+
+    assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == []
+
+
+def test_gitpublic_secret_check_rejects_tracked_scan_with_literal_rule(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "scan").write_text("regex:generic-[0-9]+\nactual-private-value\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/scan"], check=True)
+
+    assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == [".gitpublic/scan"]
+
+
+def test_gitpublic_secret_check_rejects_regex_prefix_without_generic_expression(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "scan").write_text("regex:actual-private-value\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/scan"], check=True)
+
+    assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == [".gitpublic/scan"]
 
 
 # ---- guard / default-pattern tests ----------------------------------------- #
@@ -792,6 +833,96 @@ def test_publish_blocks_stale_target_ref_before_writing_configured_head(tmp_path
         capture_output=True, text=True, check=True,
     ).stdout.splitlines()
     assert refs == ["refs/heads/stale"]
+
+
+def test_snapshot_overlay_replaces_private_readme_without_source_history(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "private@example.test"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Private Person"], check=True)
+    (source / "README.md").write_text("private internal instructions\n")
+    subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "private history"], check=True)
+    overlay = source / ".gitpublic" / "public"
+    overlay.mkdir(parents=True)
+    (overlay / "README.md").write_text("# Public project\n")
+    cfg = g.Config(source=str(source), target=str(target), delete=["README.md"], mode="snapshot")
+
+    assert g.publish(cfg, cwd=str(source)) == 0
+
+    public_readme = subprocess.run(
+        ["git", "--git-dir", str(target), "show", "refs/heads/main:README.md"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    count = subprocess.run(
+        ["git", "--git-dir", str(target), "rev-list", "--count", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    log = subprocess.run(
+        ["git", "--git-dir", str(target), "log", "--format=%an%n%ae%n%s", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert public_readme == "# Public project\n"
+    assert count == "1"
+    assert "Private Person" not in log
+    assert "private history" not in log
+
+
+def test_public_overlay_rejects_symlinks_and_non_regular_files(tmp_path: Path):
+    overlay = tmp_path / "overlay"
+    work = tmp_path / "work"
+    overlay.mkdir()
+    work.mkdir()
+    (overlay / "link").symlink_to(tmp_path / "outside")
+
+    with pytest.raises(g.OverlayError, match="symlink"):
+        g.apply_public_overlay(overlay, work)
+
+    (overlay / "link").unlink()
+    fifo = overlay / "pipe"
+    fifo.parent.mkdir(exist_ok=True)
+    os.mkfifo(fifo)
+    with pytest.raises(g.OverlayError, match="non-regular"):
+        g.apply_public_overlay(overlay, work)
+
+
+def test_public_overlay_rejects_destination_symlink_escape(tmp_path: Path):
+    overlay = tmp_path / "overlay"
+    work = tmp_path / "work"
+    outside = tmp_path / "outside"
+    (overlay / "nested").mkdir(parents=True)
+    (overlay / "nested" / "README.md").write_text("public\n")
+    work.mkdir()
+    outside.mkdir()
+    (work / "nested").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(g.OverlayError, match="destination symlink"):
+        g.apply_public_overlay(overlay, work)
+
+    assert not (outside / "README.md").exists()
+
+
+def test_overlay_content_is_scanned_before_push(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "[email protected]"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    (source / "safe.txt").write_text("safe\n")
+    subprocess.run(["git", "-C", str(source), "add", "safe.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "safe"], check=True)
+    overlay = source / ".gitpublic" / "public"
+    overlay.mkdir(parents=True)
+    (overlay / "credential.txt").write_text("ghp_" + "A" * 36 + "\n")
+    cfg = g.Config(source=str(source), target=str(target), mode="snapshot")
+
+    assert g.publish(cfg, cwd=str(source)) == 1
+    assert subprocess.run(["git", "--git-dir", str(target), "show-ref"], capture_output=True).returncode == 1
 
 
 def test_doctor_reports_missing_tools_and_config(tmp_path: Path, monkeypatch, capsys):

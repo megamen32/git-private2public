@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,7 @@ from pathlib import Path
 import time
 from typing import Iterable
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 try:
     import yaml
@@ -343,18 +344,31 @@ def clone_source(source: str, dest: Path) -> None:
     # filter-repo works on bare clones too; keep it simple.
 
 
-# Files inside .gitpublic/ that may carry literal secrets in their content
-# (replace patterns or scan rules) and therefore must never be committed.
-GITPUBLIC_SECRET_FILES = ("replace", "scan")
+# Replacement rules may contain private literals and are never safe to track.
+GITPUBLIC_REPLACE_FILE = ".gitpublic/replace"
+
+
+def _is_generic_regex_rule(rule: str) -> bool:
+    """Return true for a valid regex containing real pattern syntax."""
+    if not rule.startswith("regex:"):
+        return False
+    expression = rule[len("regex:"):]
+    try:
+        re.compile(expression)
+    except re.error:
+        return False
+    return bool(
+        re.search(r"(?<!\\)(?:\[|\(|\{|\.|\*|\+|\?|\|)|\\[dDsSwW]", expression)
+    )
 
 
 def check_local_gitpublic_secrets_not_tracked(cwd: str) -> list[str]:
-    """Refuse to publish if .gitpublic/{replace,scan} is tracked in the local repo.
+    """Return tracked policy files that can reveal literal private values.
 
-    Only ``replace`` and ``scan`` may contain literal secrets (e.g.
-    ``whisper.bezrabotnyi.com==>example.com`` or ``XYZ123`` as a scan
-    pattern). The other files in .gitpublic/ — ``config``, ``ignore``,
-    ``allow`` — are safe to commit.
+    ``replace`` is always rejected. A tracked ``scan`` is allowed only when
+    every active rule is explicitly ``regex:``; comments and blank lines are
+    ignored. This permits reusable provider signatures without allowing a
+    literal credential to become part of private Git history.
 
     Returns the list of tracked secret-bearing files. Empty list = OK.
     """
@@ -365,8 +379,26 @@ def check_local_gitpublic_secrets_not_tracked(cwd: str) -> list[str]:
     if res.returncode != 0:
         return []
     tracked = {f for f in res.stdout.splitlines() if f}
-    secret_files = {f".gitpublic/{name}" for name in GITPUBLIC_SECRET_FILES}
-    return sorted(tracked & secret_files)
+    unsafe: list[str] = []
+    if GITPUBLIC_REPLACE_FILE in tracked:
+        unsafe.append(GITPUBLIC_REPLACE_FILE)
+    scan_path = ".gitpublic/scan"
+    if scan_path in tracked:
+        indexed = subprocess.run(
+            ["git", "-C", cwd, "show", f":{scan_path}"],
+            capture_output=True,
+            text=True,
+        )
+        if indexed.returncode != 0:
+            unsafe.append(scan_path)
+        else:
+            rules = [
+                line.strip() for line in indexed.stdout.splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            if any(not _is_generic_regex_rule(rule) for rule in rules):
+                unsafe.append(scan_path)
+    return sorted(unsafe)
 
 
 def load_scan_rules(cwd: str, include_defaults: bool = False) -> list[str]:
@@ -567,24 +599,67 @@ def resolve_publish_source(configured_source: str, cwd: Path) -> str:
     return expand_github_shorthand(configured_source)
 
 
-def create_snapshot_root(repo: Path, include_source_sha: bool) -> str:
-    """Replace all history and refs with one neutral commit of the current tree.
+class OverlayError(RuntimeError):
+    """Raised when a public overlay cannot be copied without escaping policy."""
 
-    Args:
-        repo: Normal working clone whose checked-out tree becomes the snapshot.
-        include_source_sha: Add the private source commit ID to the public message.
 
-    Returns:
-        The new root commit ID.
+def _assert_within_worktree(path: Path, worktree: Path) -> None:
+    """Reject a destination whose resolved parent escapes the worktree."""
+    try:
+        path.resolve(strict=False).relative_to(worktree.resolve())
+    except ValueError as exc:
+        raise OverlayError("overlay path escapes public worktree") from exc
 
-    Raises:
-        subprocess.CalledProcessError: If Git cannot construct the snapshot.
+
+def apply_public_overlay(overlay: Path, worktree: Path) -> list[str]:
+    """Copy safe regular overlay files into the sanitized worktree.
+
+    Symlinks, special files, Git metadata paths, and destination symlink chains
+    are rejected so a private checkout cannot redirect writes outside the clone.
     """
-    source_sha = run(["git", "rev-parse", "HEAD"], cwd=str(repo)).stdout.strip()
-    tree = run(["git", "rev-parse", "HEAD^{tree}"], cwd=str(repo)).stdout.strip()
-    message = "Public source snapshot"
-    if include_source_sha:
-        message += f"\n\nSource-Commit: {source_sha}"
+    if overlay.is_symlink():
+        raise OverlayError("public overlay root must not be a symlink")
+    if not overlay.exists():
+        return []
+    if not overlay.is_dir():
+        raise OverlayError("public overlay root must be a real directory")
+
+    copied: list[str] = []
+    for root_text, directories, files in os.walk(overlay, followlinks=False):
+        root = Path(root_text)
+        for directory in directories:
+            entry = root / directory
+            mode = entry.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise OverlayError("public overlay contains a symlink")
+            if not stat.S_ISDIR(mode):
+                raise OverlayError("public overlay contains a non-regular directory entry")
+        for filename in files:
+            source = root / filename
+            relative = source.relative_to(overlay)
+            if not relative.parts or relative.parts[0] == ".git" or ".." in relative.parts:
+                raise OverlayError("public overlay path is reserved or escapes its root")
+            mode = source.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise OverlayError("public overlay contains a symlink")
+            if not stat.S_ISREG(mode):
+                raise OverlayError("public overlay contains a non-regular file")
+
+            destination = worktree / relative
+            current = worktree
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    raise OverlayError("public overlay destination symlink would escape worktree")
+            _assert_within_worktree(destination.parent, worktree)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            copied.append(relative.as_posix())
+    return copied
+
+
+def _neutral_commit_environment() -> dict[str, str]:
+    """Return deterministic, non-private author metadata for generated commits."""
     env = os.environ.copy()
     env.update(
         {
@@ -596,6 +671,52 @@ def create_snapshot_root(repo: Path, include_source_sha: bool) -> str:
             "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
         }
     )
+    return env
+
+
+def commit_public_overlay(repo: Path) -> bool:
+    """Commit staged overlay changes with neutral metadata when changes exist."""
+    run(["git", "add", "-A"], cwd=str(repo))
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"], cwd=str(repo), capture_output=True
+    )
+    if diff.returncode == 0:
+        return False
+    if diff.returncode != 1:
+        raise OverlayError("cannot inspect staged public overlay")
+    subprocess.run(
+        ["git", "commit", "-m", "Apply public overlay"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+        env=_neutral_commit_environment(),
+    )
+    return True
+
+
+def create_snapshot_root(
+    repo: Path,
+    include_source_sha: bool,
+    source_sha: str | None = None,
+) -> str:
+    """Replace all history and refs with one neutral commit of the current tree.
+
+    Args:
+        repo: Normal working clone whose checked-out tree becomes the snapshot.
+        include_source_sha: Add the private source commit ID to the public message.
+        source_sha: Original source ID captured before filtering, when available.
+
+    Returns:
+        The new root commit ID.
+
+    Raises:
+        subprocess.CalledProcessError: If Git cannot construct the snapshot.
+    """
+    if source_sha is None:
+        source_sha = run(["git", "rev-parse", "HEAD"], cwd=str(repo)).stdout.strip()
+    run(["git", "add", "-A"], cwd=str(repo))
+    tree = run(["git", "write-tree"], cwd=str(repo)).stdout.strip()
+    message = "Public source snapshot"
+    if include_source_sha:
+        message += f"\n\nSource-Commit: {source_sha}"
     created = subprocess.run(
         ["git", "commit-tree", tree],
         cwd=str(repo),
@@ -603,7 +724,7 @@ def create_snapshot_root(repo: Path, include_source_sha: bool) -> str:
         capture_output=True,
         text=True,
         check=True,
-        env=env,
+        env=_neutral_commit_environment(),
     )
     commit = created.stdout.strip()
     snapshot_ref = "refs/heads/git-private2public-snapshot"
@@ -767,6 +888,8 @@ def _break_alternates(work_gitdir: Path) -> bool:
 
 def publish(config: Config, scan_only: bool = False, cwd: str | None = None, output_format: str = "text") -> int:
     cwd = cwd or os.getcwd()
+    source_root = find_git_root(Path(cwd)) or Path(cwd).resolve()
+    overlay_path = source_root / ".gitpublic" / "public"
 
     # Only .gitpublic/{replace,scan} may carry literal secrets; the rest
     # (config / ignore / allow) is safe to commit. Refuse early if those
@@ -774,19 +897,17 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
     tracked_secrets = check_local_gitpublic_secrets_not_tracked(cwd)
     if tracked_secrets:
         sys.stderr.write(
-            "\u2717 secret-bearing .gitpublic/ files are tracked in your local repo "
+            "\u2717 unsafe .gitpublic policy is tracked in the local repo "
             "\u2014 refusing to publish.\n"
-            "  These files may hold literal secrets inside replace/scan rules;\n"
-            "  pushing them would leak them to the public repo.\n"
+            "  replace rules must stay untracked; tracked scan rules must be valid generic regex:.\n"
         )
         for f in tracked_secrets:
             sys.stderr.write(f"  {f}\n")
         sys.stderr.write(
-            "\n  Fix (keep config/ignore/allow public, hide only replace/scan):\n"
+            "\n  Fix (keep generic regex scan policy tracked if useful):\n"
             "    echo '.gitpublic/replace' >> .gitignore\n"
-            "    echo '.gitpublic/scan'    >> .gitignore\n"
-            "    git rm --cached .gitpublic/replace .gitpublic/scan\n"
-            "    git commit -m 'untrack .gitpublic/{replace,scan}'\n"
+            "    git rm --cached .gitpublic/replace\n"
+            "  Convert scan literals to generic regex rules, or untrack .gitpublic/scan.\n"
         )
         return 1
 
@@ -819,16 +940,13 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
         restore_gitdir = backup_info[1] if backup_info else None
         print(f"▸ Cloning {mask_url(source_url)} ...", file=sys.stderr)
         run(["git", "clone", "--no-local", source_url, str(work)])
+        original_source_sha = run(["git", "rev-parse", "HEAD"], cwd=str(work)).stdout.strip()
 
         # Break object-store alternates so filter-repo cannot corrupt source
         _break_alternates(work / ".git")
 
         # Detach origin (filter-repo removes it anyway)
         run(["git", "remote", "remove", "origin"], cwd=str(work), check=False)
-
-        if config.mode == "snapshot":
-            print("▸ Creating one-commit public snapshot ...", file=sys.stderr)
-            create_snapshot_root(work, config.snapshot_include_source_sha)
 
         # Write replace-text file
         replace_file = tmp_path / "replacements.txt"
@@ -853,6 +971,24 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
                 restore = ("\n  Run: rsync -a " + backup_path + "/. /home/roomhacker/gptadmin/.git/ to restore") if backup_path else ""
                 sys.stderr.write(res.stderr)
                 sys.exit("git-filter-repo failed (rc=" + str(res.returncode) + ")" + bk + restore)
+
+        try:
+            overlay_files = apply_public_overlay(overlay_path, work)
+        except OverlayError as exc:
+            print(f"✗ Public overlay rejected: {exc}", file=sys.stderr)
+            return 1
+        if overlay_files:
+            print(f"▸ Applied public overlay ({len(overlay_files)} file(s)).", file=sys.stderr)
+
+        if config.mode == "snapshot":
+            print("▸ Creating one-commit public snapshot ...", file=sys.stderr)
+            create_snapshot_root(
+                work,
+                config.snapshot_include_source_sha,
+                source_sha=original_source_sha,
+            )
+        elif overlay_files:
+            commit_public_overlay(work)
 
         # Scan the complete result before any ref can reach the target. Built-in
         # credential patterns are mandatory and custom rules are additive.

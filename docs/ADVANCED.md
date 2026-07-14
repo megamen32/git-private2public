@@ -16,7 +16,7 @@ private repo
   -> push to public repo             (.gitpublic/config)
 ```
 
-Missing custom files mean “no custom rules for that step”. Built-in credential detection remains active for zero-config scans and guard mode.
+Missing custom files mean “no custom rules for that step”. Built-in credential detection remains active for every publish, zero-config scan, and guard run.
 
 | File | If present | If missing or empty |
 |------|------------|---------------------|
@@ -26,6 +26,7 @@ Missing custom files mean “no custom rules for that step”. Built-in credenti
 | `.gitpublic/scan` | Adds custom blocking patterns | Built-in credential rules still protect zero-config scans and guard mode |
 | `.gitpublic/allow` | Exceptions for domain-like matches found by `scan` | No scan exceptions exist |
 | `.gitpublic/domains` | Same as `allow` alias | Nothing is allowlisted |
+| `.gitpublic/public/` | Adds or replaces files in the sanitized public tree | No public-only overlay is applied |
 
 ## `.gitpublic/config`
 
@@ -83,6 +84,17 @@ What it does:
 
 It removes files from Git history in the temporary sanitized clone. It does not edit your private repo.
 
+## `.gitpublic/public/`
+
+Files below this directory are copied into the sanitized tree after delete and
+replace rules. Relative paths are preserved, so
+`.gitpublic/public/README.md` becomes public `README.md`. Overlay files are
+committed and pass the same mandatory secret scan as every other public file.
+
+In `snapshot` mode the overlay is applied before genesis is constructed, so
+the public output still contains exactly one root commit. Symlinks, special
+files, `.git` paths, and destination path escapes are rejected.
+
 ## `.gitpublic/replace`
 
 One replacement per line:
@@ -112,6 +124,10 @@ regex:.*\.corp\.internal ==> example.com
 ```
 
 ## `.gitpublic/scan`
+
+Generic scan policy may be tracked when every active rule starts with
+`regex:`. Literal scan rules must remain untracked because the literal itself
+may be private. `.gitpublic/replace` must always remain untracked.
 
 `.gitpublic/scan` adds custom blocking rules. Built-in credential rules are always available for zero-config scans and guard mode.
 

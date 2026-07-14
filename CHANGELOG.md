@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Add `.gitpublic/public/` overlays for public-only files after sanitization.
+- Keep snapshot publications at exactly one root commit after applying overlays.
+- Reject overlay symlinks, special files, reserved paths, and destination escapes.
+- Permit tracked `.gitpublic/scan` policy when every active rule is generic `regex:`.
+
 ## 0.2.0
 
 - Add fail-closed scanning of every reachable blob, commit, and annotated tag.
