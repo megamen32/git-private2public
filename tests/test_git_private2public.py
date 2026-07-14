@@ -115,8 +115,8 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.2.1"
-    assert 'version = "0.2.1"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    assert g.__version__ == "0.2.2"
+    assert 'version = "0.2.2"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -460,6 +460,22 @@ def test_remote_ref_sha_reads_exact_sha(monkeypatch):
     sha = "a" * 40
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **kw: subprocess_completed(stdout=f"{sha}\trefs/heads/main\n", returncode=0))
     assert g._remote_ref_sha("example", "refs/heads/main") == sha
+
+
+def test_remote_ref_sha_timeout_fails_closed_without_url_leak(monkeypatch):
+    secret_url = "https://x-access-token:super-secret-token@example.test/private.git"
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], timeout=30)
+
+    monkeypatch.setattr(g.subprocess, "run", timeout)
+    with pytest.raises(SystemExit) as error:
+        g._remote_ref_sha(secret_url, "refs/heads/main")
+
+    message = str(error.value)
+    assert message == "cannot read target ref: operation timed out"
+    assert secret_url not in message
+    assert "super-secret-token" not in message
 
 
 @pytest.mark.parametrize(

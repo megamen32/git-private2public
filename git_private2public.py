@@ -35,7 +35,7 @@ from pathlib import Path
 import time
 from typing import Iterable
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 try:
     import yaml
@@ -739,12 +739,14 @@ def create_snapshot_root(
 
 
 def _remote_ref_sha(url: str, ref: str) -> str:
-    res = subprocess.run(
-        ["git", "ls-remote", url, ref], capture_output=True, text=True, timeout=30
-    )
+    try:
+        res = subprocess.run(
+            ["git", "ls-remote", url, ref], capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("cannot read target ref: operation timed out") from None
     if res.returncode != 0:
-        err = (res.stderr or res.stdout).strip()
-        raise SystemExit(f"cannot read target ref {ref}: {err}")
+        raise SystemExit("cannot read target ref")
     line = res.stdout.strip().splitlines()
     return line[0].split()[0] if line else ""
 
@@ -758,8 +760,8 @@ def _remote_refs(url: str) -> dict[str, str]:
             text=True,
             timeout=30,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise SystemExit("cannot enumerate target refs: operation timed out") from exc
+    except subprocess.TimeoutExpired:
+        raise SystemExit("cannot enumerate target refs: operation timed out") from None
     if result.returncode != 0:
         raise SystemExit("cannot enumerate target refs")
     refs: dict[str, str] = {}

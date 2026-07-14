@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Fail closed with a concise redacted error when target-ref preflight times out.
+- Prevent Git remote errors from echoing credential-bearing target URLs.
+
 ## 0.2.1
 
 - Add `.gitpublic/public/` overlays for public-only files after sanitization.
