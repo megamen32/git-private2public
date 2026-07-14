@@ -1,6 +1,6 @@
 [project]
 name = "git-private2public"
-version = "0.1.8"
+version = "0.2.0"
 description = "Like .gitignore, but for what goes public. Keep a sanitized public mirror of your private repo."
 readme = "README.md"
 license = {text = "MIT"}

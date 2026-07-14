@@ -39,6 +39,19 @@ push_branches = main
 push_tags = false
 ```
 
+For a first public release, `snapshot` mode publishes only the sanitized
+current tracked tree as one neutral root commit. It removes private commit
+messages, authors, branches, tags, and previous history before filtering:
+
+```ini
+mode = snapshot
+snapshot_include_source_sha = false
+```
+
+Set `snapshot_include_source_sha = true` only when intentionally exposing the
+private source commit ID. Snapshot mode rejects `push_tags = true`. Normal
+`history` mode remains the default.
+
 `source` and `target` can be:
 
 ```text
@@ -142,7 +155,7 @@ example.com
 
 Important details:
 
-- `allow` does not scan by itself; it only cancels a matching `scan` violation for the exact allowed domain;
+- `allow` does not scan by itself; it only cancels a matching `scan` violation when the whole matched value exactly equals the allowed domain (case-insensitive);
 - `allow` does not replace anything;
 - `allow` only matters when a `scan` rule matched;
 - `allow` is checked against the matched text itself, not nearby text;
