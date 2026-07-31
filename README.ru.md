@@ -2,7 +2,9 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/git-private2public.svg)](https://pypi.org/project/git-private2public/) [![CI](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml/badge.svg)](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml)
 
-**[English](./README.md)** · **[Русский](./README.ru.md)**
+**[English](./README.md)** · **[Русский](./README.ru.md)** · **[简体中文](./README.zh.md)**
+
+![Рабочее место git-private2public](docs/assets/readme-hero.png)
 
 ---
 
@@ -16,7 +18,7 @@
 ## Быстрый старт
 
 ```bash
-pip install git-private2public
+python3 -m pip install git-private2public
 git-private2public init          # создаёт папку .gitpublic/
 ```
 
@@ -220,10 +222,12 @@ regex:.*\.corp\.internal ==> example.com
 ## Установка
 
 ```bash
-pip install git-private2public
+python3 -m pip install git-private2public
 ```
 
 Готово. Теперь есть команда `git-private2public`.
+
+Из локального checkout установите пакет одной командой `python3 -m pip install .`.
 
 > Без pip? [Ручная установка одного файла](./git_private2public.py) — скачать +
 > `chmod +x` (нужно `pip install git-filter-repo pyyaml`).

@@ -2,7 +2,11 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/git-private2public.svg)](https://pypi.org/project/git-private2public/) [![CI](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml/badge.svg)](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml)
 
-**[English](./README.md)** · **[Русский](./README.ru.md)**
+**[English](./README.md)** · **[Русский](./README.ru.md)** · **[简体中文](./README.zh.md)**
+
+![git-private2public repository review](docs/assets/readme-hero.png)
+
+> Checked in this workspace with Python 3.10.12, pytest 8.4.2, and Git 2.34.1.
 
 ---
 
@@ -220,10 +224,12 @@ More examples: [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANC
 ## Install
 
 ```bash
-pip install git-private2public
+python3 -m pip install git-private2public
 ```
 
 That's it. Now you have the `git-private2public` command.
+
+From a local checkout, use the same one-command path with `python3 -m pip install .`.
 
 > No pip? [Single-file manual install](./git_private2public.py) — download +
 > `chmod +x` (needs `pip install git-filter-repo pyyaml`).
