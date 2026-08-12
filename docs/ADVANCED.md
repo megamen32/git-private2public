@@ -16,16 +16,17 @@ private repo
   -> push to public repo             (.gitpublic/config)
 ```
 
-Missing files mean “no rules for that step”. They do not enable hidden defaults.
+Missing custom files mean “no custom rules for that step”. Built-in credential detection remains active for every publish, zero-config scan, and guard run.
 
 | File | If present | If missing or empty |
 |------|------------|---------------------|
 | `.gitpublic/config` | Defines source, target, push settings | `source`/`target` are required, so publish cannot run |
 | `.gitpublic/ignore` | Removes matching files/paths from all published history | No files are removed |
 | `.gitpublic/replace` | Rewrites matching text in remaining files | No text is rewritten |
-| `.gitpublic/scan` | Fails if any scan pattern is still present after cleanup | Nothing is blocked by scan |
+| `.gitpublic/scan` | Adds custom blocking patterns | Built-in credential rules still protect zero-config scans and guard mode |
 | `.gitpublic/allow` | Exceptions for domain-like matches found by `scan` | No scan exceptions exist |
 | `.gitpublic/domains` | Same as `allow` alias | Nothing is allowlisted |
+| `.gitpublic/public/` | Adds or replaces files in the sanitized public tree | No public-only overlay is applied |
 
 ## `.gitpublic/config`
 
@@ -38,6 +39,19 @@ push_force = true
 push_branches = main
 push_tags = false
 ```
+
+For a first public release, `snapshot` mode publishes only the sanitized
+current tracked tree as one neutral root commit. It removes private commit
+messages, authors, branches, tags, and previous history before filtering:
+
+```ini
+mode = snapshot
+snapshot_include_source_sha = false
+```
+
+Set `snapshot_include_source_sha = true` only when intentionally exposing the
+private source commit ID. Snapshot mode rejects `push_tags = true`. Normal
+`history` mode remains the default.
 
 `source` and `target` can be:
 
@@ -70,6 +84,17 @@ What it does:
 
 It removes files from Git history in the temporary sanitized clone. It does not edit your private repo.
 
+## `.gitpublic/public/`
+
+Files below this directory are copied into the sanitized tree after delete and
+replace rules. Relative paths are preserved, so
+`.gitpublic/public/README.md` becomes public `README.md`. Overlay files are
+committed and pass the same mandatory secret scan as every other public file.
+
+In `snapshot` mode the overlay is applied before genesis is constructed, so
+the public output still contains exactly one root commit. Symlinks, special
+files, `.git` paths, and destination path escapes are rejected.
+
 ## `.gitpublic/replace`
 
 One replacement per line:
@@ -100,7 +125,11 @@ regex:.*\.corp\.internal ==> example.com
 
 ## `.gitpublic/scan`
 
-`scan` is the only thing that blocks a publish after cleanup.
+Generic scan policy may be tracked when every active rule starts with
+`regex:`. Literal scan rules must remain untracked because the literal itself
+may be private. `.gitpublic/replace` must always remain untracked.
+
+`.gitpublic/scan` adds custom blocking rules. Built-in credential rules are always available for zero-config scans and guard mode.
 
 One rule per line:
 
@@ -118,7 +147,7 @@ Forms:
 | `literal text` | fail if exact text remains |
 | `regex:pattern` | fail if regex matches |
 
-If `.gitpublic/scan` does not exist or has no active rules, nothing is blocked at this step.
+If `.gitpublic/scan` is missing, no custom rules are added. Built-in credential detection still works in zero-config scans and guard mode.
 
 ## Domains and `.gitpublic/allow`
 
@@ -142,7 +171,7 @@ example.com
 
 Important details:
 
-- `allow` does not scan by itself; it only cancels a matching `scan` violation for the exact allowed domain;
+- `allow` does not scan by itself; it only cancels a matching `scan` violation when the whole matched value exactly equals the allowed domain (case-insensitive);
 - `allow` does not replace anything;
 - `allow` only matters when a `scan` rule matched;
 - `allow` is checked against the matched text itself, not nearby text;
@@ -214,7 +243,7 @@ Result:
 | Refuse publish if value survived | `scan` |
 | Make an exception for a public domain matched by broad domain scan | `allow` |
 | Auto-block every domain | add a broad domain regex to `scan` |
-| Auto-block secrets without rules | not supported; write `scan` rules or use external scanners before publishing |
+| Auto-block known credential formats | built in; no custom rule required |
 
 ## Hook mode
 
@@ -228,7 +257,7 @@ Installs a Git `pre-push` hook in the current private repo. On every `git push`,
 git-private2public publish -c .gitpublic
 ```
 
-If a non-`git-private2public` hook already exists, it refuses to overwrite it.
+Existing user hooks are preserved and chained. Guard and auto-publish can coexist in one managed dispatcher.
 
 ## YAML compatibility
 

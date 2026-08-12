@@ -2,273 +2,71 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/git-private2public.svg)](https://pypi.org/project/git-private2public/) [![CI](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml/badge.svg)](https://github.com/megamen32/git-private2public/actions/workflows/ci.yml)
 
-**[English](./README.md)** · **[Русский](./README.ru.md)** · **[简体中文](./README.zh.md)**
-
-![git-private2public repository review](docs/assets/readme-hero.png)
-
-> Repository checks recorded in this workspace: Python 3.10.12, pytest 8.4.2,
-> and Git 2.34.1.
-
----
+**[English](./README.md)** · **[Русский](./README.ru.md)**
 
 **Like `.gitignore`, but for what goes public.**
 
-Need the full rule-by-rule explanation? Read [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
-
-You have a private repo and need a public mirror with selected files removed,
-private text rewritten, and a final scan before publication. This tool runs
-that policy-driven cleanup in a temporary clone; it does not alter the source
-repo.
-
-## Quick start
+Install it, run it inside a Git repository, and follow the prompts.
 
 ```bash
 pip install git-private2public
-git-private2public init          # creates .gitpublic/ folder
+git-private2public
 ```
 
-Edit `.gitpublic/config` — set source + target. Values can be `owner/repo`, a full Git URL, or a local path:
+That is enough to scan tracked files and Git history for known credentials. No config is required. In an interactive terminal, the tool can also enable automatic checks before every `git push`.
 
-```
-source = you/private-repo
-target = you/public-repo
-```
+## What do you want to do?
 
-Edit `.gitpublic/ignore` — files to hide, one per line (like `.gitignore`):
-
-```
-.env
-secrets/
-*.key
-```
-
-Publish:
+### Check this repository
 
 ```bash
+git-private2public
+```
+
+The tool scans the repository and explains what it found. Secret values are never printed in full.
+
+### Publish a safe public copy
+
+```bash
+git-private2public init
 git-private2public publish
 ```
 
-The publish stops when a configured scan still matches. Review the result and
-rotate any real secret separately; no sanitizer can prove that a value was
-never exposed elsewhere.
+`init` guides you through the one-time setup. `publish` creates a cleaned public mirror without changing the private repository.
 
-## Choose your safety level
-
-| Need | Command | What it proves |
-|---|---|---|
-| Prepare a mirror | `git-private2public publish` | The configured cleanup and scan completed before push |
-| Check without pushing | `git-private2public scan` | The temporary cleaned result passes the configured scan |
-| Block risky pushes | `git-private2public guard enable` | Tracked files and Git history are checked before `git push` |
-
-The built-in guard uses known provider-token patterns plus your custom
-`.gitpublic/scan` rules. It is a refusal mechanism, not a history scrubber.
-
-## Auto-publish on every `git push`
+### Something is not working
 
 ```bash
-git-private2public hook enable     # on
-git push                           # also publishes public mirror
-git-private2public hook disable    # off
+git-private2public doctor
 ```
 
-Native git hook. No CI, no GitHub Actions. Works offline.
+`doctor` checks Git, configuration, hooks and access to both repositories, then tells you what to fix.
 
-## Guard — pre-push safety net
+## Simple by default
 
-`guard` installs a lightweight pre-push hook that **blocks** `git push` if
-scanned content matches known secret patterns. Unlike `hook` (which also
-rewrites history and force-pushes a public mirror), `guard` is purely a
-refusal mechanism — no clone, no filter-repo, no push.
+- no setup is needed for scanning;
+- safe credential rules are built in;
+- one clear command performs one clear action;
+- interactive sessions explain the next step;
+- advanced settings remain available when needed.
 
-```bash
-git-private2public guard enable    # install pre-push hook
-git-private2public guard status    # is it on?
-git-private2public guard disable   # remove the hook
-git-private2public guard run       # manual scan (also what the hook does)
+Most users only need:
+
+```text
+git-private2public           scan now
+git-private2public init      prepare private → public publishing
+git-private2public publish   publish the clean copy
+git-private2public doctor    diagnose a problem
 ```
 
-**What it scans — by default:**
-1. Every tracked file in the working tree (`git ls-files`).
-2. **Every blob in git history** — catches secrets committed in old commits
-   and later removed from HEAD but never rewritten via filter-repo.
-   Use `--no-history` to skip this (faster, but won't catch old leaks).
+Everything else—custom rules, replacements, CI JSON, hooks, branches, tags, YAML compatibility and implementation details—is documented separately:
 
-**Default secret patterns (always on, no `.gitpublic/` required):**
-- OpenAI: `sk-...`, `sk-proj-...`
-- GitHub: `ghp_...`, `github_pat_...`, `gho_...`, `ghs_...`, `ghr_...`
-- HuggingFace: `hf_...`
-- Slack: `xox[baprs]-...`
-- AWS access key IDs: `AKIA...`
-- Google API keys: `AIza...`, `ya29.*`
-- GitLab PATs: `glpat-...`
-- Generic JWTs: `eyJ...?...?...`
-- PEM private-key headers: `-----BEGIN ... PRIVATE KEY-----`
+**[Advanced configuration](./docs/ADVANCED.md)**
 
-**Custom patterns:** drop them into `.gitpublic/scan`, one per line (literal
-or `regex:...`). They layer on top of the defaults.
+## Safety
 
-**Allowlist:** anything in `.gitpublic/allow` is treated as an exception for
-broad regex rules that happen to match a public domain.
-
-**Bypass for one push (NOT recommended):**
-
-```bash
-GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push
-```
-
-**What guard tells you when it refuses the push:**
-
-The error message is tailored to where the secret lives:
-
-- **In the working tree** — points at the file, suggests editing,
-  `.gitignore` + `git rm --cached`, and reminds you to rotate a live
-  secret before committing.
-- **In git history** — explains that editing HEAD isn't enough, and
-  prints the exact next step:
-  - `git-private2public publish` (if you have a `.gitpublic/` set up), or
-  - `git filter-repo --replace-text replacements.txt --force` (manual),
-    with the `replacements.txt` format.
-
-When both happen, you get both sections.
-
-If you only want guard and not `hook` (publish) — `guard enable` works
-independently. They share the same pre-push file, so `guard enable` refuses
-to install if `hook` is already there; disable one before enabling the
-other.
-
-### Why scan history?
-
-A secret leaked into a commit last month, removed from HEAD yesterday, but
-the commit object still exists in `.git/objects/`. Pushing HEAD won't
-expose it directly, but anyone who already has the repo and runs
-`git log -p` will see it. Guard's history scan catches this. To actually
-*remove* it from history, run `git-private2public publish` (which uses
-filter-repo), or `git filter-repo --replace-text` manually.
-
-## The `.gitpublic/` folder
-
-Each file is one concern. Like `.gitignore` — one rule per line, `#` for
-comments. If a file is missing, that setting is just empty.
-
-| File | What goes in it | Format |
-|------|-----------------|--------|
-| `config` | source, target, push settings | `key = value` |
-| `ignore` | files to NOT publish | one path/glob per line |
-| `replace` | find → replace in file contents | `old ==> new` per line |
-| `scan` | refuse to push if matched | one pattern per line |
-| `allow` | exceptions for domain rules in `scan` | one allowed matched domain per line |
-
-**Easy** — just edit `ignore`:
-
-```
-.env
-secrets/
-*.key
-```
-
-**Medium** — also edit `replace`:
-
-```
-<PRIVATE_IP> ==> 203.0.113.5
-real-token ==> ***
-regex:[A-Fa-f0-9]{64} ==> ***
-```
-
-**Hard** — also edit `scan` + `allow`:
-
-```
-# scan:
-regex:github_pat_[A-Za-z0-9_]{30,}
-regex:192\.168\.
-regex:[a-z0-9.-]+\.[a-z]{2,}
-
-# allow:
-github.com
-get.docker.com
-```
-
-## Commands
-
-```
-init        create .gitpublic/ config
-scan        clean into a temp repo, scan, don't push
-publish     clean + push
-hook        enable / disable / status
-guard       enable / disable / status / run  (pre-push secret scanner)
-```
-
-## How `allow` / domains work
-
-Nothing is auto-blocked just because it is a domain.
-
-`allow` is an exception list for `scan`. If `.gitpublic/scan` is missing or empty, `allow` does nothing and domains are not checked at all.
-
-To block domain-looking strings, add a broad domain rule to `.gitpublic/scan`:
-
-```
-regex:[a-z0-9.-]+\.[a-z]{2,}
-```
-
-Now every matched domain fails the scan unless the matched domain itself is listed in `.gitpublic/allow`:
-
-```
-github.com
-get.docker.com
-example.com
-```
-
-`allow` does not replace private domains. Use `.gitpublic/replace` for that:
-
-```
-private.company.local ==> example.com
-regex:.*\.corp\.internal ==> example.com
-```
-
-Analogy: `scan` says “ban everything matching this pattern”, `allow` says “except these exact public domains”.
-
-Rule of thumb:
-
-| You want to... | File |
-|---|---|
-| remove files | `.gitpublic/ignore` |
-| rewrite private text/domain/IP | `.gitpublic/replace` |
-| fail if a secret/domain/IP survived | `.gitpublic/scan` |
-| make exceptions for public domains caught by scan | `.gitpublic/allow` |
-
-More examples: [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
-
-## Install
-
-```bash
-python3 -m pip install git-private2public
-```
-
-That's it. Now you have the `git-private2public` command.
-
-From a local checkout, use the same one-command path with `python3 -m pip install .`.
-
-> No pip? [Single-file manual install](./git_private2public.py) — download +
-> `chmod +x` (needs `pip install git-filter-repo pyyaml`).
-
-## Why
-
-Git has no "private file in a public repo". So you need two repos. This keeps
-them in sync — without leaking.
-
-| | delete files | replace text | scan | auto push | pre-push guard |
-|---|:---:|:---:|:---:|:---:|:---:|
-| git-filter-repo | ✅ | ✅ | ❌ | ❌ | ❌ |
-| BFG | ✅ | ✅ | ❌ | ❌ | ❌ |
-| dupligit | ❌ | ❌ | ❌ | ✅ | ❌ |
-| gitleaks / trufflehog | ❌ | ❌ | ✅ | ❌ | ✅ (separate tool) |
-| **git-private2public** | ✅ | ✅ | ✅ | ✅ | ✅ (built-in) |
+Publishing works in a temporary clone. The private repository is not rewritten. Concurrent public updates are protected with `--force-with-lease`, pushed commits are verified, and existing tags are never force-overwritten.
 
 ## License
 
 MIT
-
-## Evidence and limits
-
-See [verification notes](./docs/VERIFICATION.md) for the checks behind this
-README and the claims this project deliberately does not make. Configuration
-examples and rule semantics remain in [Advanced configuration](./docs/ADVANCED.md).

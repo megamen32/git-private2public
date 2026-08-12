@@ -1,5 +1,7 @@
 from pathlib import Path
 import subprocess
+import json
+import os
 
 import pytest
 
@@ -22,6 +24,20 @@ def test_folder_config_loads_allow_and_domains_alias(tmp_path: Path):
     assert cfg.allow_domains == ["github.com", "example.com"]
     assert cfg.push_force is False
     assert cfg.push_branches == ["main", "dev"]
+
+
+def test_folder_config_loads_snapshot_mode(tmp_path: Path):
+    cfgdir = tmp_path / ".gitpublic"
+    cfgdir.mkdir()
+    (cfgdir / "config").write_text(
+        "source = owner/private\ntarget = owner/public\n"
+        "mode = snapshot\nsnapshot_include_source_sha = true\n"
+    )
+
+    cfg = g.Config.load(cfgdir)
+
+    assert cfg.mode == "snapshot"
+    assert cfg.snapshot_include_source_sha is True
 
 
 def test_yaml_config_accepts_allow_alias(tmp_path: Path):
@@ -74,7 +90,9 @@ def test_allow_domains_are_bytes_safe(tmp_path: Path, monkeypatch: pytest.Monkey
     violations = g.scan_tree(repo, cfg)
 
     assert len(violations) == 1
-    assert "private.example.local" in violations[0]
+    assert "private.example.local" not in violations[0]
+    assert "len=" in violations[0]
+    assert "sha256=" in violations[0]
 
 
 def test_github_shorthand_expansion_and_masking():
@@ -97,7 +115,8 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.1.7"
+    assert g.__version__ == "0.2.2"
+    assert 'version = "0.2.2"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -133,6 +152,46 @@ def test_gitpublic_secret_check_clean_when_only_safe_files_tracked(tmp_path: Pat
     subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/"])
 
     assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == []
+
+
+def test_gitpublic_secret_check_allows_tracked_generic_regex_scan(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "scan").write_text(
+        "# Generic provider signatures are safe policy\n"
+        "regex:ghp_[A-Za-z0-9]{30,}\n"
+        "regex:AKIA[0-9A-Z]{16}\n"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/scan"], check=True)
+
+    assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == []
+
+
+def test_gitpublic_secret_check_rejects_tracked_scan_with_literal_rule(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "scan").write_text("regex:generic-[0-9]+\nactual-private-value\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/scan"], check=True)
+
+    assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == [".gitpublic/scan"]
+
+
+def test_gitpublic_secret_check_rejects_regex_prefix_without_generic_expression(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    gp = repo / ".gitpublic"
+    gp.mkdir()
+    (gp / "scan").write_text("regex:actual-private-value\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitpublic/scan"], check=True)
+
+    assert g.check_local_gitpublic_secrets_not_tracked(str(repo)) == [".gitpublic/scan"]
 
 
 # ---- guard / default-pattern tests ----------------------------------------- #
@@ -185,7 +244,7 @@ def test_scan_local_repo_blocks_github_pat(tmp_path: Path):
     (repo / "token.txt").write_text("ghp_abcdefghijklmnopqrstuvwxyz0123456789\n")
     subprocess.run(["git", "-C", str(repo), "add", "token.txt"])
     violations = g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[])
-    assert any("GitHub PAT" in v or "ghp_" in v for v in violations)
+    assert any("GitHub" in v for v in violations)
 
 
 def test_scan_local_repo_blocks_aws_access_key(tmp_path: Path):
@@ -273,13 +332,12 @@ def test_scan_history_finds_old_blob(tmp_path: Path):
     subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "move to vault"])
 
     violations = g.scan_history(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[])
-    assert any("sk-proj" in v for v in violations), \
+    assert any("OpenAI project" in v for v in violations), \
         f"history scan missed the old blob: {violations}"
 
 
-def test_scan_history_skips_oversized_blobs(tmp_path: Path, monkeypatch):
-    """Blobs larger than DEFAULT_MAX_BLOB_BYTES are skipped — they're almost
-    always binary assets where regex would only produce noise."""
+def test_scan_history_blocks_oversized_blobs_instead_of_skipping(tmp_path: Path, monkeypatch):
+    """A blob beyond the configured safe scan bound must fail closed."""
     repo = tmp_path / "r"
     repo.mkdir()
     subprocess.run(["git", "-C", str(repo), "init", "-q"])
@@ -289,10 +347,8 @@ def test_scan_history_skips_oversized_blobs(tmp_path: Path, monkeypatch):
     subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"])
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"])
     subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "big"])
-    # Even if the blob contained a fake "secret", with size cap = 10 bytes
-    # nothing is read or scanned. Verify scan returns [] for the empty rules:
-    violations = g.scan_history(repo, rules=[], allow_domains=[])
-    assert violations == []
+    violations = g.scan_history(repo, rules=["regex:never-matches"], allow_domains=[])
+    assert any("oversized blob" in violation for violation in violations)
 
 
 def test_scan_history_empty_rules_returns_empty(tmp_path: Path):
@@ -303,6 +359,10 @@ def test_scan_history_empty_rules_returns_empty(tmp_path: Path):
 
 
 import argparse
+
+
+def subprocess_completed(stdout: str = "", returncode: int = 0):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
 
 def test_validate_config_single_repo_falls_back_to_origin(tmp_path: Path, monkeypatch):
@@ -383,35 +443,590 @@ def test_guard_run_message_mentions_working_tree_fix(tmp_path: Path, monkeypatch
     assert "git-private2public publish" not in out
 
 
-def test_publish_uses_plain_force_not_force_with_lease():
-    """Regressed once: --force-with-lease failed with 'stale info' because
-    the freshly-added target remote has no remote-tracking ref to compare
-    against. We must use plain --force."""
+def test_publish_uses_explicit_force_with_lease():
+    """Forced publication must be tied to the exact target SHA observed before rewrite."""
     import inspect
-    import re as _re
     src = inspect.getsource(g.publish)
-    # Drop comments so we only look at real code.
-    code = _re.sub(r"#[^\n]*\n", "", src)
-    assert '"--force"' in code or "'--force'" in code
-    assert "force-with-lease" not in code
+    assert "--force-with-lease=refs/heads/" in src
+    assert 'push_cmd.append("--force")' not in src
 
 
-import subprocess as _sp
+def test_remote_ref_sha_returns_empty_for_missing_ref(monkeypatch):
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **kw: subprocess_completed(stdout="", returncode=0))
+    assert g._remote_ref_sha("example", "refs/heads/main") == ""
 
 
-def subprocess_completed(stdout: str = "", returncode: int = 0) -> _sp.CompletedProcess:
-    return _sp.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+def test_remote_ref_sha_reads_exact_sha(monkeypatch):
+    sha = "a" * 40
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **kw: subprocess_completed(stdout=f"{sha}\trefs/heads/main\n", returncode=0))
+    assert g._remote_ref_sha("example", "refs/heads/main") == sha
 
 
-def test_publish_uses_plain_force_not_force_with_lease():
-    """Regressed to --force-with-lease once: that failed with 'stale info'
-    because the freshly-added 'target' remote has no remote-tracking ref
-    to compare against, so --force-with-lease refuses to push. We must
-    use plain --force after a clone we just performed ourselves."""
-    import inspect
-    import re as _re
-    src = inspect.getsource(g.publish)
-    # Drop comment lines so we only inspect real code, not prose.
-    code = _re.sub(r"#[^\n]*\n", "", src)
-    assert '"--force"' in code or "'--force'" in code
-    assert "force-with-lease" not in code
+def test_remote_ref_sha_timeout_fails_closed_without_url_leak(monkeypatch):
+    secret_url = "https://x-access-token:super-secret-token@example.test/private.git"
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], timeout=30)
+
+    monkeypatch.setattr(g.subprocess, "run", timeout)
+    with pytest.raises(SystemExit) as error:
+        g._remote_ref_sha(secret_url, "refs/heads/main")
+
+    message = str(error.value)
+    assert message == "cannot read target ref: operation timed out"
+    assert secret_url not in message
+    assert "super-secret-token" not in message
+
+
+@pytest.mark.parametrize(
+    "unexpected_ref",
+    ["refs/heads/stale", "refs/tags/stale", "refs/notes/private"],
+)
+def test_target_ref_allowlist_blocks_unexpected_refs_before_push(monkeypatch, unexpected_ref: str):
+    monkeypatch.setattr(g, "_remote_refs", lambda url: {unexpected_ref: "a" * 40})
+
+    with pytest.raises(SystemExit, match="unexpected target refs"):
+        g._verify_target_ref_names("target", {"refs/heads/main"})
+
+
+def test_target_ref_allowlist_accepts_configured_head_and_tags(monkeypatch):
+    expected = {
+        "refs/heads/main": "a" * 40,
+        "refs/tags/v1.0.0": "b" * 40,
+    }
+    monkeypatch.setattr(g, "_remote_refs", lambda url: dict(expected))
+
+    g._verify_target_ref_names("target", set(expected))
+    g._verify_target_refs_exact("target", expected)
+
+
+def test_post_push_ref_verification_blocks_missing_or_changed_refs(monkeypatch):
+    expected = {"refs/heads/main": "a" * 40, "refs/tags/v1.0.0": "b" * 40}
+    monkeypatch.setattr(g, "_remote_refs", lambda url: {"refs/heads/main": "c" * 40})
+
+    with pytest.raises(SystemExit, match="post-push target refs differ"):
+        g._verify_target_refs_exact("target", expected)
+
+
+def test_remote_refs_ignores_symbolic_head_and_peeled_tag(monkeypatch):
+    tag = "b" * 40
+    monkeypatch.setattr(
+        g.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess_completed(
+            stdout=(
+                f"{'a' * 40}\tHEAD\n"
+                f"{tag}\trefs/tags/v1\n"
+                f"{'c' * 40}\trefs/tags/v1^{{}}\n"
+            )
+        ),
+    )
+
+    assert g._remote_refs("target") == {"refs/tags/v1": tag}
+
+
+def test_hook_dispatcher_preserves_foreign_hook_and_combines_actions(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    hook_dir = repo / ".git" / "hooks"
+    hook_dir.mkdir(parents=True, exist_ok=True)
+    hook = hook_dir / "pre-push"
+    hook.write_text("#!/bin/sh\necho original\n")
+    hook.chmod(0o755)
+    monkeypatch.chdir(repo)
+
+    g._set_hook_action(repo, "guard", True)
+    g._set_hook_action(repo, "publish", True, str(repo / ".gitpublic"))
+
+    content = hook.read_text()
+    assert g.HOOK_DISPATCHER_MARKER in content
+    assert "guard run" in content
+    assert "publish -c" in content
+    original = hook_dir / "pre-push.git-private2public-original"
+    assert original.exists()
+    assert "echo original" in original.read_text()
+
+    g._set_hook_action(repo, "guard", False)
+    g._set_hook_action(repo, "publish", False)
+    assert "echo original" in hook.read_text()
+    assert not original.exists()
+
+
+def test_guard_json_report_is_machine_readable(tmp_path: Path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "token.txt").write_text("ghp_" + "A" * 36 + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "token.txt"], check=True)
+    monkeypatch.chdir(repo)
+    rc = g.cmd_guard_run(argparse.Namespace(history=False, format="json"))
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["count"] >= 1
+    assert payload["findings"]
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-ant-" + "api03-" + "A" * 32,
+        "ASIA" + "A" * 16,
+        "123456789:" + "A" * 35,
+        "npm_" + "A" * 36,
+        "pypi-" + "A" * 48,
+        "sk_" + "live_" + "A" * 24,
+        "rk_" + "test_" + "A" * 24,
+        "SG." + "A" * 16 + "." + "B" * 20,
+        "MTA" + "A" * 24 + "." + "B" * 6 + "." + "C" * 24,
+        "SK" + "0123456789abcdef" * 2,
+        "key-" + "0123456789abcdef" * 2,
+        "dop_v1_" + "A" * 64,
+    ],
+)
+def test_extended_default_patterns_detect_provider_credentials(tmp_path: Path, secret: str):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "credential.txt").write_text(secret + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "credential.txt"], check=True)
+
+    violations = g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[])
+    assert violations, f"expected built-in guard to detect {secret[:12]}…"
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "accessToken: string",
+        "clientSecret?: string",
+        "sha1-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "0123456789abcdef0123456789abcdef01234567",
+        "example npm token: npm_your_token_here",
+        "Telegram token format: <bot-id>:<token>",
+    ],
+)
+def test_extended_default_patterns_avoid_common_false_positives(tmp_path: Path, safe_text: str):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "safe.txt").write_text(safe_text + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
+
+    assert g.scan_local_repo(repo, g.DEFAULT_SECRET_PATTERNS, allow_domains=[]) == []
+
+
+def test_redacted_report_never_contains_secret():
+    secret = b"ghp_" + b"A" * 32 + b"1b2C"
+    report = g.format_violation("config.env", 7, g.DEFAULT_SECRET_PATTERNS[3], secret)
+    assert secret.decode() not in report
+    assert "1b2C" not in report
+    assert "len=40" in report
+    assert "sha256=" in report
+    assert "config.env:7" in report
+    assert "GitHub" in report
+
+
+@pytest.mark.parametrize(
+    ("secret", "hint"),
+    [
+        (b"sk-ant-" + b"A" * 20 + b"9XyZ", "sk-ant-…9XyZ"),
+        (b"123456789:" + b"A" * 30 + b"7QwE", "123…:…7QwE"),
+        (b"AKIA" + b"A" * 12 + b"4RtY", "AKIA…4RtY"),
+    ],
+)
+def test_redacted_report_has_rotation_friendly_hint(secret: bytes, hint: str):
+    rendered = g.redact_match(secret)
+    assert hint not in rendered
+    assert secret.decode() not in rendered
+
+
+def test_effective_publish_rules_always_include_defaults_and_custom():
+    custom = ["regex:company-secret-[0-9]+"]
+
+    rules = g.effective_scan_rules(custom)
+
+    assert rules[: len(g.DEFAULT_SECRET_PATTERNS)] == g.DEFAULT_SECRET_PATTERNS
+    assert rules[-1] == custom[0]
+
+
+def test_allow_domain_requires_exact_match(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "domains.txt").write_text("github.com\ngithub.com.evil.example\n")
+    subprocess.run(["git", "-C", str(repo), "add", "domains.txt"], check=True)
+
+    violations = g.scan_local_repo(
+        repo,
+        [r"regex:[a-z0-9.-]+\.[a-z]{2,}"],
+        allow_domains=["github.com"],
+    )
+
+    assert len(violations) == 1
+
+
+def test_history_enumeration_timeout_fails_closed(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], timeout=1)
+
+    monkeypatch.setattr(g.subprocess, "run", timeout)
+    with pytest.raises(g.ScanError, match="history enumeration timed out"):
+        g.scan_history(repo, ["regex:secret"], [])
+
+
+def test_reachable_history_scan_includes_tags_only_when_requested(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "value.txt").write_text("company-secret-12345\n")
+    subprocess.run(["git", "-C", str(repo), "add", "value.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "tagged secret"], check=True)
+    subprocess.run(["git", "-C", str(repo), "tag", "unsafe"], check=True)
+    (repo / "value.txt").write_text("public\n")
+    subprocess.run(["git", "-C", str(repo), "add", "value.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "clean"], check=True)
+    subprocess.run(["git", "-C", str(repo), "rebase", "--onto", "HEAD", "HEAD~1"], check=False)
+    # Make the branch root clean while retaining the old secret exclusively via tag.
+    subprocess.run(["git", "-C", str(repo), "checkout", "--orphan", "clean-main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "rm", "-rf", "."], check=True, capture_output=True)
+    (repo / "value.txt").write_text("public\n")
+    subprocess.run(["git", "-C", str(repo), "add", "value.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "clean root"], check=True)
+
+    rule = ["regex:company-secret-[0-9]+"]
+    assert g.scan_history(repo, rule, [], refs=["HEAD"]) == []
+    assert g.scan_history(repo, rule, [], refs=["HEAD", "refs/tags/unsafe"])
+
+
+def test_reachable_history_scan_checks_commit_messages(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "[email protected]"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "safe.txt").write_text("safe\n")
+    subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "contains company-secret-98765"],
+        check=True,
+    )
+
+    violations = g.scan_history(repo, ["regex:company-secret-[0-9]+"], [])
+
+    assert violations
+
+
+def test_local_source_is_preferred_when_configured_remote_matches_origin(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:alice/private.git"], check=True)
+
+    resolved = g.resolve_publish_source("git@github.com:alice/private.git", repo)
+
+    assert resolved == str(repo.resolve())
+
+
+def test_snapshot_root_discards_history_tags_and_source_metadata(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "private@example.test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Private Person"], check=True)
+    (repo / "public.txt").write_text("first\n")
+    subprocess.run(["git", "-C", str(repo), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "private message"], check=True)
+    subprocess.run(["git", "-C", str(repo), "tag", "private-tag"], check=True)
+    (repo / "public.txt").write_text("current\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "another private message"], check=True)
+
+    g.create_snapshot_root(repo, include_source_sha=False)
+
+    assert subprocess.run(["git", "-C", str(repo), "rev-list", "--count", "HEAD"], capture_output=True, text=True, check=True).stdout.strip() == "1"
+    assert subprocess.run(["git", "-C", str(repo), "tag", "--list"], capture_output=True, text=True, check=True).stdout.strip() == ""
+    log = subprocess.run(["git", "-C", str(repo), "log", "--format=%an%n%ae%n%s"], capture_output=True, text=True, check=True).stdout
+    assert "Private Person" not in log
+    assert "private message" not in log
+    assert (repo / "public.txt").read_text() == "current\n"
+
+
+def test_snapshot_mode_rejects_tag_publication():
+    cfg = g.Config(source="a", target="b", mode="snapshot", push_tags=True)
+
+    with pytest.raises(SystemExit, match="snapshot mode cannot publish tags"):
+        g.validate_config(cfg)
+
+
+def test_publish_scan_blocks_builtin_secret_reachable_only_from_tag(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "[email protected]"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    (source / "value.txt").write_text("ghp_" + "A" * 36 + "\n")
+    subprocess.run(["git", "-C", str(source), "add", "value.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "tag only"], check=True)
+    subprocess.run(["git", "-C", str(source), "tag", "unsafe"], check=True)
+    subprocess.run(["git", "-C", str(source), "checkout", "--orphan", "clean-main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(source), "rm", "-rf", "."], check=True, capture_output=True)
+    (source / "value.txt").write_text("public\n")
+    subprocess.run(["git", "-C", str(source), "add", "value.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "clean root"], check=True)
+    cfg = g.Config(source=str(source), target=str(target), push_tags=True)
+
+    assert g.publish(cfg, scan_only=True, cwd=str(source)) == 1
+    assert subprocess.run(["git", "--git-dir", str(target), "show-ref"], capture_output=True).returncode == 1
+
+
+def test_snapshot_publish_creates_single_public_root_without_tags(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "private@example.test"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Private Person"], check=True)
+    (source / "public.txt").write_text("old\n")
+    subprocess.run(["git", "-C", str(source), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "private old"], check=True)
+    subprocess.run(["git", "-C", str(source), "tag", "private-tag"], check=True)
+    (source / "public.txt").write_text("current\n")
+    subprocess.run(["git", "-C", str(source), "commit", "-qam", "private current"], check=True)
+    cfg = g.Config(source=str(source), target=str(target), mode="snapshot")
+
+    assert g.publish(cfg, cwd=str(source)) == 0
+
+    count = subprocess.run(
+        ["git", "--git-dir", str(target), "rev-list", "--count", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    refs = subprocess.run(
+        ["git", "--git-dir", str(target), "for-each-ref", "--format=%(refname)"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    log = subprocess.run(
+        ["git", "--git-dir", str(target), "log", "--format=%an%n%ae%n%s", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert count == "1"
+    assert refs == ["refs/heads/main"]
+    assert "Private Person" not in log
+    assert "private current" not in log
+
+
+def test_publish_blocks_stale_target_ref_before_writing_configured_head(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "[email protected]"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    (source / "safe.txt").write_text("safe\n")
+    subprocess.run(["git", "-C", str(source), "add", "safe.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "safe"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "push", "-q", str(target), "HEAD:refs/heads/stale"],
+        check=True,
+    )
+    cfg = g.Config(source=str(source), target=str(target), mode="snapshot")
+
+    with pytest.raises(SystemExit, match="unexpected target refs"):
+        g.publish(cfg, cwd=str(source))
+
+    refs = subprocess.run(
+        ["git", "--git-dir", str(target), "for-each-ref", "--format=%(refname)"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert refs == ["refs/heads/stale"]
+
+
+def test_snapshot_overlay_replaces_private_readme_without_source_history(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "private@example.test"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Private Person"], check=True)
+    (source / "README.md").write_text("private internal instructions\n")
+    subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "private history"], check=True)
+    overlay = source / ".gitpublic" / "public"
+    overlay.mkdir(parents=True)
+    (overlay / "README.md").write_text("# Public project\n")
+    cfg = g.Config(source=str(source), target=str(target), delete=["README.md"], mode="snapshot")
+
+    assert g.publish(cfg, cwd=str(source)) == 0
+
+    public_readme = subprocess.run(
+        ["git", "--git-dir", str(target), "show", "refs/heads/main:README.md"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    count = subprocess.run(
+        ["git", "--git-dir", str(target), "rev-list", "--count", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    log = subprocess.run(
+        ["git", "--git-dir", str(target), "log", "--format=%an%n%ae%n%s", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert public_readme == "# Public project\n"
+    assert count == "1"
+    assert "Private Person" not in log
+    assert "private history" not in log
+
+
+def test_public_overlay_rejects_symlinks_and_non_regular_files(tmp_path: Path):
+    overlay = tmp_path / "overlay"
+    work = tmp_path / "work"
+    overlay.mkdir()
+    work.mkdir()
+    (overlay / "link").symlink_to(tmp_path / "outside")
+
+    with pytest.raises(g.OverlayError, match="symlink"):
+        g.apply_public_overlay(overlay, work)
+
+    (overlay / "link").unlink()
+    fifo = overlay / "pipe"
+    fifo.parent.mkdir(exist_ok=True)
+    os.mkfifo(fifo)
+    with pytest.raises(g.OverlayError, match="non-regular"):
+        g.apply_public_overlay(overlay, work)
+
+
+def test_public_overlay_rejects_destination_symlink_escape(tmp_path: Path):
+    overlay = tmp_path / "overlay"
+    work = tmp_path / "work"
+    outside = tmp_path / "outside"
+    (overlay / "nested").mkdir(parents=True)
+    (overlay / "nested" / "README.md").write_text("public\n")
+    work.mkdir()
+    outside.mkdir()
+    (work / "nested").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(g.OverlayError, match="destination symlink"):
+        g.apply_public_overlay(overlay, work)
+
+    assert not (outside / "README.md").exists()
+
+
+def test_overlay_content_is_scanned_before_push(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "[email protected]"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    (source / "safe.txt").write_text("safe\n")
+    subprocess.run(["git", "-C", str(source), "add", "safe.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "safe"], check=True)
+    overlay = source / ".gitpublic" / "public"
+    overlay.mkdir(parents=True)
+    (overlay / "credential.txt").write_text("ghp_" + "A" * 36 + "\n")
+    cfg = g.Config(source=str(source), target=str(target), mode="snapshot")
+
+    assert g.publish(cfg, cwd=str(source)) == 1
+    assert subprocess.run(["git", "--git-dir", str(target), "show-ref"], capture_output=True).returncode == 1
+
+
+def test_doctor_reports_missing_tools_and_config(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(g.shutil, "which", lambda name: None)
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **kw: subprocess_completed(returncode=1))
+    rc = g.cmd_doctor(argparse.Namespace(config=".gitpublic"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "git-filter-repo" in out
+    assert "not inside a git repository" in out
+    assert "Doctor:" in out
+
+
+def test_scan_without_config_uses_builtin_guard(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "safe.txt").write_text("hello\n")
+    subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
+    monkeypatch.chdir(repo)
+    assert g.cmd_scan(argparse.Namespace(config=".gitpublic", format="text")) == 0
+
+
+def test_scan_without_config_detects_secret(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "token.txt").write_text("ghp_" + "A" * 36 + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "token.txt"], check=True)
+    monkeypatch.chdir(repo)
+    assert g.cmd_scan(argparse.Namespace(config=".gitpublic", format="text")) == 1
+
+
+def test_default_command_scans_and_does_not_prompt_noninteractive(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "safe.txt").write_text("safe\n")
+    subprocess.run(["git", "-C", str(repo), "add", "safe.txt"], check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: False)
+    assert g.cmd_default(argparse.Namespace()) == 0
+    assert not (repo / ".git" / "hooks" / "pre-push").exists()
+
+
+def test_interactive_default_can_enable_guard(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+    g._interactive_offer_guard()
+    hook = repo / ".git" / "hooks" / "pre-push"
+    assert hook.exists()
+    assert "guard run" in hook.read_text()
+
+
+def test_interactive_init_uses_origin_and_asks_only_for_public_target(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:alice/private.git"], check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: True)
+    answers = iter(["", "alice/public"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    rc = g.cmd_init(argparse.Namespace(path=".gitpublic", force=False))
+    config = (repo / ".gitpublic" / "config").read_text()
+
+    assert rc == 0
+    assert "source = git@github.com:alice/private.git" in config
+    assert "target = alice/public" in config
+
+
+def test_noninteractive_init_remains_deterministic(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(g.sys.stdout, "isatty", lambda: False)
+
+    rc = g.cmd_init(argparse.Namespace(path=".gitpublic", force=False))
+    config = (tmp_path / ".gitpublic" / "config").read_text()
+
+    assert rc == 0
+    assert "source = you/private-repo" in config
+    assert "target = you/public-repo" in config

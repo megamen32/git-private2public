@@ -21,18 +21,21 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
+import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
 from typing import Iterable
 
-__version__ = "0.1.7"
+__version__ = "0.2.2"
 
 try:
     import yaml
@@ -43,13 +46,14 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 # Default secret patterns
 # --------------------------------------------------------------------------- #
-# Always-on safety net applied by `guard` (and optionally by `publish`).
+# Always-on safety net applied by both `guard` and `publish`.
 # Catches the common offenders people accidentally commit: API keys for the
 # usual providers. Add custom patterns in .gitpublic/scan — they layer on top.
 
 DEFAULT_SECRET_PATTERNS: list[str] = [
     "regex:sk-[A-Za-z0-9]{20,}",                        # OpenAI legacy
     "regex:sk-proj-[A-Za-z0-9_-]{40,}",                 # OpenAI project
+    "regex:sk-ant-[A-Za-z0-9_-]{20,}",                  # Anthropic
     "regex:ghp_[A-Za-z0-9]{30,}",                       # GitHub PAT (classic)
     "regex:github_pat_[A-Za-z0-9_]{30,}",               # GitHub fine-grained PAT
     "regex:gho_[A-Za-z0-9]{30,}",                       # GitHub OAuth
@@ -57,10 +61,20 @@ DEFAULT_SECRET_PATTERNS: list[str] = [
     "regex:ghr_[A-Za-z0-9]{30,}",                       # GitHub refresh token
     "regex:hf_[A-Za-z0-9]{20,}",                        # HuggingFace
     "regex:xox[baprs]-[A-Za-z0-9-]{10,}",               # Slack
-    "regex:AKIA[0-9A-Z]{16}",                           # AWS access key ID
+    "regex:AKIA[0-9A-Z]{16}",                           # AWS long-term access key ID
+    "regex:ASIA[0-9A-Z]{16}",                           # AWS temporary access key ID
     "regex:AIza[0-9A-Za-z_-]{35}",                      # Google API key
     "regex:ya29\\.[0-9A-Za-z_-]{20,}",                  # Google OAuth refresh
     "regex:glpat-[A-Za-z0-9_-]{20,}",                   # GitLab PAT
+    "regex:[0-9]{6,12}:[A-Za-z0-9_-]{30,50}",           # Telegram bot token
+    "regex:npm_[A-Za-z0-9]{30,}",                       # npm access token
+    "regex:pypi-[A-Za-z0-9_-]{40,}",                    # PyPI API token
+    "regex:(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",   # Stripe secret/restricted key
+    r"regex:SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}", # SendGrid API key
+    r"regex:(?:MTA|MTE|MTI|MTM|MTQ|MTU|MTY|MTc|MTg|MTk)[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}",  # Discord bot token
+    "regex:SK[0-9a-fA-F]{32}",                          # Twilio API key
+    "regex:key-[0-9a-zA-Z]{32}",                        # Mailgun private API key
+    "regex:dop_v1_[A-Za-z0-9]{64}",                    # DigitalOcean personal access token
     "regex:eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+",  # JWT (catch-all)
     "regex:-----BEGIN [A-Z ]*PRIVATE KEY-----",         # PEM private key header
 ]
@@ -81,6 +95,8 @@ class Config:
     push_force: bool = True
     push_branches: list[str] = field(default_factory=lambda: ["main"])
     push_tags: bool = False
+    mode: str = "history"
+    snapshot_include_source_sha: bool = False
 
     @classmethod
     def from_yaml(cls, path: Path) -> "Config":
@@ -96,6 +112,8 @@ class Config:
             push_force=push.get("force", True),
             push_branches=list(push.get("branches") or ["main"]),
             push_tags=push.get("tags", False),
+            mode=str(data.get("mode") or "history"),
+            snapshot_include_source_sha=bool(data.get("snapshot_include_source_sha", False)),
         )
 
     @classmethod
@@ -127,6 +145,8 @@ class Config:
         push_force = True
         push_branches = ["main"]
         push_tags = False
+        mode = "history"
+        snapshot_include_source_sha = False
         cfg_file = folder / "config"
         if cfg_file.exists():
             for line in cfg_file.read_text().splitlines():
@@ -145,6 +165,10 @@ class Config:
                     push_branches = [b.strip() for b in v.split(",") if b.strip()]
                 elif k == "push_tags":
                     push_tags = v.lower() in ("true", "yes", "1")
+                elif k == "mode":
+                    mode = v
+                elif k == "snapshot_include_source_sha":
+                    snapshot_include_source_sha = v.lower() in ("true", "yes", "1")
 
         return cls(
             source=source,
@@ -156,6 +180,8 @@ class Config:
             push_force=push_force,
             push_branches=push_branches,
             push_tags=push_tags,
+            mode=mode,
+            snapshot_include_source_sha=snapshot_include_source_sha,
         )
 
     @classmethod
@@ -305,6 +331,10 @@ def validate_config(config: Config, cwd: str | None = None) -> None:
         missing.append("target")
     if missing:
         raise SystemExit(f"missing required config value(s): {', '.join(missing)}")
+    if config.mode not in {"history", "snapshot"}:
+        raise SystemExit("mode must be 'history' or 'snapshot'")
+    if config.mode == "snapshot" and config.push_tags:
+        raise SystemExit("snapshot mode cannot publish tags")
 
 
 def clone_source(source: str, dest: Path) -> None:
@@ -314,18 +344,31 @@ def clone_source(source: str, dest: Path) -> None:
     # filter-repo works on bare clones too; keep it simple.
 
 
-# Files inside .gitpublic/ that may carry literal secrets in their content
-# (replace patterns or scan rules) and therefore must never be committed.
-GITPUBLIC_SECRET_FILES = ("replace", "scan")
+# Replacement rules may contain private literals and are never safe to track.
+GITPUBLIC_REPLACE_FILE = ".gitpublic/replace"
+
+
+def _is_generic_regex_rule(rule: str) -> bool:
+    """Return true for a valid regex containing real pattern syntax."""
+    if not rule.startswith("regex:"):
+        return False
+    expression = rule[len("regex:"):]
+    try:
+        re.compile(expression)
+    except re.error:
+        return False
+    return bool(
+        re.search(r"(?<!\\)(?:\[|\(|\{|\.|\*|\+|\?|\|)|\\[dDsSwW]", expression)
+    )
 
 
 def check_local_gitpublic_secrets_not_tracked(cwd: str) -> list[str]:
-    """Refuse to publish if .gitpublic/{replace,scan} is tracked in the local repo.
+    """Return tracked policy files that can reveal literal private values.
 
-    Only ``replace`` and ``scan`` may contain literal secrets (e.g.
-    ``whisper.bezrabotnyi.com==>example.com`` or ``XYZ123`` as a scan
-    pattern). The other files in .gitpublic/ — ``config``, ``ignore``,
-    ``allow`` — are safe to commit.
+    ``replace`` is always rejected. A tracked ``scan`` is allowed only when
+    every active rule is explicitly ``regex:``; comments and blank lines are
+    ignored. This permits reusable provider signatures without allowing a
+    literal credential to become part of private Git history.
 
     Returns the list of tracked secret-bearing files. Empty list = OK.
     """
@@ -336,8 +379,26 @@ def check_local_gitpublic_secrets_not_tracked(cwd: str) -> list[str]:
     if res.returncode != 0:
         return []
     tracked = {f for f in res.stdout.splitlines() if f}
-    secret_files = {f".gitpublic/{name}" for name in GITPUBLIC_SECRET_FILES}
-    return sorted(tracked & secret_files)
+    unsafe: list[str] = []
+    if GITPUBLIC_REPLACE_FILE in tracked:
+        unsafe.append(GITPUBLIC_REPLACE_FILE)
+    scan_path = ".gitpublic/scan"
+    if scan_path in tracked:
+        indexed = subprocess.run(
+            ["git", "-C", cwd, "show", f":{scan_path}"],
+            capture_output=True,
+            text=True,
+        )
+        if indexed.returncode != 0:
+            unsafe.append(scan_path)
+        else:
+            rules = [
+                line.strip() for line in indexed.stdout.splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            if any(not _is_generic_regex_rule(rule) for rule in rules):
+                unsafe.append(scan_path)
+    return sorted(unsafe)
 
 
 def load_scan_rules(cwd: str, include_defaults: bool = False) -> list[str]:
@@ -345,8 +406,8 @@ def load_scan_rules(cwd: str, include_defaults: bool = False) -> list[str]:
 
     With include_defaults=True (used by `guard`), the canonical set of
     provider API-key patterns is prepended to whatever the user added in
-    .gitpublic/scan. With False (legacy publish behaviour), only the
-    user's rules are returned.
+    .gitpublic/scan. With False, only the user's rules are returned. The
+    publish flow layers defaults with ``effective_scan_rules`` after loading.
     """
     custom: list[str] = []
     scan_file = Path(cwd) / ".gitpublic" / "scan"
@@ -394,14 +455,69 @@ def write_replace_file(path: Path, rules: list[ReplaceRule]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Redacted findings
+# --------------------------------------------------------------------------- #
+
+_PATTERN_LABELS = {
+    "sk-ant-": "Anthropic API key",
+    "sk-proj-": "OpenAI project key",
+    "sk-": "OpenAI API key",
+    "github_pat_": "GitHub fine-grained PAT",
+    "ghp_": "GitHub classic PAT",
+    "AKIA": "AWS access key",
+    "ASIA": "AWS temporary access key",
+    "npm_": "npm token",
+    "pypi-": "PyPI token",
+    r"SG\.": "SendGrid API key",
+    "dop_v1_": "DigitalOcean token",
+    "PRIVATE KEY": "private key",
+}
+
+
+def describe_pattern(raw: str) -> str:
+    for needle, label in _PATTERN_LABELS.items():
+        if needle in raw:
+            return label
+    return "credential-like value"
+
+
+def redact_match(matched: bytes) -> str:
+    """Describe a match without reproducing any portion of the credential."""
+    digest = hashlib.sha256(matched).hexdigest()[:12]
+    return f"[redacted len={len(matched)} sha256={digest}]"
+
+
+def format_violation(location: str, line: int, raw: str, matched: bytes) -> str:
+    return f"{location}:{line}: {describe_pattern(raw)} — {redact_match(matched)}"
+
+
+class ScanError(RuntimeError):
+    """Raised when a security scan cannot prove that the input is safe."""
+
+
+def effective_scan_rules(custom_rules: list[str]) -> list[str]:
+    """Return always-on built-ins followed by non-duplicate custom rules."""
+    rules = list(DEFAULT_SECRET_PATTERNS)
+    rules.extend(rule for rule in custom_rules if rule not in rules)
+    return rules
+
+
+def _allowed_match(matched: bytes, allow_domains: list[str]) -> bool:
+    """Return true only when the whole matched value equals an allowed domain."""
+    try:
+        value = matched.decode("utf-8").casefold()
+    except UnicodeDecodeError:
+        return False
+    return value in {domain.strip().casefold() for domain in allow_domains}
+
+
+# --------------------------------------------------------------------------- #
 # Scanning
 # --------------------------------------------------------------------------- #
 
 def scan_tree(repo: Path, config: Config) -> list[str]:
     """Return list of violations (pattern + file:line) in the current tree."""
     violations: list[str] = []
-    allow_re = re.compile(b"|".join(re.escape(d.encode()) for d in config.allow_domains)) if config.allow_domains else None
-
     # Compile fail_on_match patterns
     compiled: list[tuple[str, re.Pattern]] = []
     for raw in config.fail_on_match:
@@ -429,12 +545,11 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
                 # Using surrounding context would accidentally allow `private.local`
                 # just because `github.com` appears nearby on the same line/paragraph.
                 matched = m.group(0)
-                if allow_re and allow_re.search(matched):
+                if _allowed_match(matched, config.allow_domains):
                     continue
                 # Find line number
                 line = data[:m.start()].count(b"\n") + 1
-                snippet = data[m.start():m.end() + 20].decode("utf-8", "replace")[:60]
-                violations.append(f"{fpath}:{line}: matches '{raw}' → ...{snippet}...")
+                violations.append(format_violation(fpath, line, raw, matched))
     return violations
 
 
@@ -443,7 +558,288 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def _backup_gitdir(source: str, cwd: str) -> str | None:
+def _source_gitdir(source: str) -> Path | None:
+    src_path = Path(source).expanduser().resolve()
+    gitdir = src_path / ".git"
+    if gitdir.is_file():
+        ref = gitdir.read_text().strip()
+        gitdir = Path(ref.split(":", 1)[-1].strip()).expanduser().resolve()
+    return gitdir if gitdir.exists() else None
+
+
+def _normalized_git_location(value: str) -> str:
+    """Normalize common GitHub URL spellings for identity comparison only."""
+    expanded = expand_github_shorthand(value).rstrip("/")
+    match = re.search(r"github\.com[/:]([^/]+/[^/]+?)(?:\.git)?$", expanded)
+    if match:
+        return f"github.com/{match.group(1).removesuffix('.git').casefold()}"
+    path = Path(value).expanduser()
+    if path.exists():
+        return str(path.resolve())
+    return expanded
+
+
+def resolve_publish_source(configured_source: str, cwd: Path) -> str:
+    """Use the local repository when its origin matches the configured source.
+
+    A pre-push hook runs before the private remote advances. Cloning that remote
+    would therefore publish the previous commit. Cloning the matching local
+    repository captures the exact commit currently being pushed.
+    """
+    repo = find_git_root(cwd)
+    if repo is None:
+        return expand_github_shorthand(configured_source)
+    result = subprocess.run(
+        ["git", "-C", str(repo), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and _normalized_git_location(result.stdout.strip()) == _normalized_git_location(configured_source):
+        return str(repo.resolve())
+    return expand_github_shorthand(configured_source)
+
+
+class OverlayError(RuntimeError):
+    """Raised when a public overlay cannot be copied without escaping policy."""
+
+
+def _assert_within_worktree(path: Path, worktree: Path) -> None:
+    """Reject a destination whose resolved parent escapes the worktree."""
+    try:
+        path.resolve(strict=False).relative_to(worktree.resolve())
+    except ValueError as exc:
+        raise OverlayError("overlay path escapes public worktree") from exc
+
+
+def apply_public_overlay(overlay: Path, worktree: Path) -> list[str]:
+    """Copy safe regular overlay files into the sanitized worktree.
+
+    Symlinks, special files, Git metadata paths, and destination symlink chains
+    are rejected so a private checkout cannot redirect writes outside the clone.
+    """
+    if overlay.is_symlink():
+        raise OverlayError("public overlay root must not be a symlink")
+    if not overlay.exists():
+        return []
+    if not overlay.is_dir():
+        raise OverlayError("public overlay root must be a real directory")
+
+    copied: list[str] = []
+    for root_text, directories, files in os.walk(overlay, followlinks=False):
+        root = Path(root_text)
+        for directory in directories:
+            entry = root / directory
+            mode = entry.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise OverlayError("public overlay contains a symlink")
+            if not stat.S_ISDIR(mode):
+                raise OverlayError("public overlay contains a non-regular directory entry")
+        for filename in files:
+            source = root / filename
+            relative = source.relative_to(overlay)
+            if not relative.parts or relative.parts[0] == ".git" or ".." in relative.parts:
+                raise OverlayError("public overlay path is reserved or escapes its root")
+            mode = source.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise OverlayError("public overlay contains a symlink")
+            if not stat.S_ISREG(mode):
+                raise OverlayError("public overlay contains a non-regular file")
+
+            destination = worktree / relative
+            current = worktree
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    raise OverlayError("public overlay destination symlink would escape worktree")
+            _assert_within_worktree(destination.parent, worktree)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            copied.append(relative.as_posix())
+    return copied
+
+
+def _neutral_commit_environment() -> dict[str, str]:
+    """Return deterministic, non-private author metadata for generated commits."""
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "git-private2public",
+            "GIT_AUTHOR_EMAIL": "noreply@localhost",
+            "GIT_COMMITTER_NAME": "git-private2public",
+            "GIT_COMMITTER_EMAIL": "noreply@localhost",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+        }
+    )
+    return env
+
+
+def commit_public_overlay(repo: Path) -> bool:
+    """Commit staged overlay changes with neutral metadata when changes exist."""
+    run(["git", "add", "-A"], cwd=str(repo))
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"], cwd=str(repo), capture_output=True
+    )
+    if diff.returncode == 0:
+        return False
+    if diff.returncode != 1:
+        raise OverlayError("cannot inspect staged public overlay")
+    subprocess.run(
+        ["git", "commit", "-m", "Apply public overlay"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+        env=_neutral_commit_environment(),
+    )
+    return True
+
+
+def create_snapshot_root(
+    repo: Path,
+    include_source_sha: bool,
+    source_sha: str | None = None,
+) -> str:
+    """Replace all history and refs with one neutral commit of the current tree.
+
+    Args:
+        repo: Normal working clone whose checked-out tree becomes the snapshot.
+        include_source_sha: Add the private source commit ID to the public message.
+        source_sha: Original source ID captured before filtering, when available.
+
+    Returns:
+        The new root commit ID.
+
+    Raises:
+        subprocess.CalledProcessError: If Git cannot construct the snapshot.
+    """
+    if source_sha is None:
+        source_sha = run(["git", "rev-parse", "HEAD"], cwd=str(repo)).stdout.strip()
+    run(["git", "add", "-A"], cwd=str(repo))
+    tree = run(["git", "write-tree"], cwd=str(repo)).stdout.strip()
+    message = "Public source snapshot"
+    if include_source_sha:
+        message += f"\n\nSource-Commit: {source_sha}"
+    created = subprocess.run(
+        ["git", "commit-tree", tree],
+        cwd=str(repo),
+        input=message + "\n",
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_neutral_commit_environment(),
+    )
+    commit = created.stdout.strip()
+    snapshot_ref = "refs/heads/git-private2public-snapshot"
+    run(["git", "update-ref", snapshot_ref, commit], cwd=str(repo))
+    run(["git", "symbolic-ref", "HEAD", snapshot_ref], cwd=str(repo))
+    refs = run(["git", "for-each-ref", "--format=%(refname)"], cwd=str(repo)).stdout.splitlines()
+    for ref_name in refs:
+        if ref_name != snapshot_ref:
+            run(["git", "update-ref", "-d", ref_name], cwd=str(repo))
+    run(["git", "checkout", "-f", "git-private2public-snapshot"], cwd=str(repo))
+    return commit
+
+
+def _remote_ref_sha(url: str, ref: str) -> str:
+    try:
+        res = subprocess.run(
+            ["git", "ls-remote", url, ref], capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("cannot read target ref: operation timed out") from None
+    if res.returncode != 0:
+        raise SystemExit("cannot read target ref")
+    line = res.stdout.strip().splitlines()
+    return line[0].split()[0] if line else ""
+
+
+def _remote_refs(url: str) -> dict[str, str]:
+    """Return advertised real refs, excluding symbolic HEAD and peeled aliases."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("cannot enumerate target refs: operation timed out") from None
+    if result.returncode != 0:
+        raise SystemExit("cannot enumerate target refs")
+    refs: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            raise SystemExit("cannot enumerate target refs: malformed response")
+        object_id, ref_name = parts
+        if ref_name == "HEAD" or ref_name.endswith("^{}"):
+            continue
+        refs[ref_name] = object_id
+    return refs
+
+
+def _verify_target_ref_names(url: str, allowed_refs: set[str]) -> None:
+    """Block publication when the target retains any unconfigured ref."""
+    unexpected = sorted(set(_remote_refs(url)) - allowed_refs)
+    if unexpected:
+        preview = ", ".join(unexpected[:10])
+        suffix = f" and {len(unexpected) - 10} more" if len(unexpected) > 10 else ""
+        raise SystemExit(f"unexpected target refs block publication: {preview}{suffix}")
+
+
+def _verify_target_refs_exact(url: str, expected_refs: dict[str, str]) -> None:
+    """Require the remote ref names and object IDs to equal the publication set."""
+    actual_refs = _remote_refs(url)
+    if actual_refs != expected_refs:
+        missing = sorted(set(expected_refs) - set(actual_refs))
+        unexpected = sorted(set(actual_refs) - set(expected_refs))
+        changed = sorted(
+            ref for ref in set(actual_refs) & set(expected_refs)
+            if actual_refs[ref] != expected_refs[ref]
+        )
+        details = []
+        if missing:
+            details.append(f"missing={','.join(missing[:5])}")
+        if unexpected:
+            details.append(f"unexpected={','.join(unexpected[:5])}")
+        if changed:
+            details.append(f"changed={','.join(changed[:5])}")
+        raise SystemExit(f"post-push target refs differ: {'; '.join(details)}")
+
+
+def _local_publish_refs(work: Path, config: Config, head: str) -> dict[str, str]:
+    """Build the exact remote ref set that a successful publish must expose."""
+    expected = {f"refs/heads/{branch}": head for branch in config.push_branches}
+    if config.push_tags:
+        result = run(
+            ["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/tags/"],
+            cwd=str(work),
+        )
+        for line in result.stdout.splitlines():
+            object_id, ref_name = line.split(maxsplit=1)
+            expected[ref_name] = object_id
+    return expected
+
+
+def _verify_remote_ref(url: str, ref: str, expected: str) -> None:
+    actual = _remote_ref_sha(url, ref)
+    if actual != expected:
+        raise SystemExit(
+            f"post-push verification failed for {ref}: expected {expected}, got {actual or '<missing>'}"
+        )
+    print(f"✓ Verified {ref} at {actual[:12]}", file=sys.stderr)
+
+
+def _repo_size_bytes(path: Path) -> int:
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _backup_gitdir(source: str, cwd: str) -> tuple[str, str] | None:
     """Create a timestamped backup of the source gitdir before filter-repo.
     Backups: ~/.cache/git-private2public/backups/<source>/<ts>/
     Keeps max 5 backups per source. Returns path or None.
@@ -456,11 +852,8 @@ def _backup_gitdir(source: str, cwd: str) -> str | None:
         backup_root.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         backup_path = backup_root / ts
-        gitdir = src_path / ".git"
-        if gitdir.is_file():
-            ref = gitdir.read_text().strip()
-            gitdir = Path(ref.split(":", 1)[-1].strip()).expanduser().resolve()
-        if not gitdir.exists():
+        gitdir = _source_gitdir(source)
+        if not gitdir:
             msg = "ℹ No gitdir found at {} -- skipping backup.".format(gitdir)
             print(msg, file=sys.stderr); return None
         msg = "ℹ Backing up gitdir ({}) to {} ...".format(gitdir, backup_path)
@@ -470,7 +863,7 @@ def _backup_gitdir(source: str, cwd: str) -> str | None:
         for old in backups[:-5]:
             shutil.rmtree(old)
             print("✓ Rotated out old backup " + old.name, file=sys.stderr)
-        return str(backup_path)
+        return str(backup_path), str(gitdir)
     except Exception as ex:
         print("⚠ Backup failed (continuing anyway): " + str(ex), file=sys.stderr)
         return None
@@ -495,8 +888,10 @@ def _break_alternates(work_gitdir: Path) -> bool:
         if subp.exists(): shutil.rmtree(subp, ignore_errors=True)
     return True
 
-def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> int:
+def publish(config: Config, scan_only: bool = False, cwd: str | None = None, output_format: str = "text") -> int:
     cwd = cwd or os.getcwd()
+    source_root = find_git_root(Path(cwd)) or Path(cwd).resolve()
+    overlay_path = source_root / ".gitpublic" / "public"
 
     # Only .gitpublic/{replace,scan} may carry literal secrets; the rest
     # (config / ignore / allow) is safe to commit. Refuse early if those
@@ -504,19 +899,17 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
     tracked_secrets = check_local_gitpublic_secrets_not_tracked(cwd)
     if tracked_secrets:
         sys.stderr.write(
-            "\u2717 secret-bearing .gitpublic/ files are tracked in your local repo "
+            "\u2717 unsafe .gitpublic policy is tracked in the local repo "
             "\u2014 refusing to publish.\n"
-            "  These files may hold literal secrets inside replace/scan rules;\n"
-            "  pushing them would leak them to the public repo.\n"
+            "  replace rules must stay untracked; tracked scan rules must be valid generic regex:.\n"
         )
         for f in tracked_secrets:
             sys.stderr.write(f"  {f}\n")
         sys.stderr.write(
-            "\n  Fix (keep config/ignore/allow public, hide only replace/scan):\n"
+            "\n  Fix (keep generic regex scan policy tracked if useful):\n"
             "    echo '.gitpublic/replace' >> .gitignore\n"
-            "    echo '.gitpublic/scan'    >> .gitignore\n"
-            "    git rm --cached .gitpublic/replace .gitpublic/scan\n"
-            "    git commit -m 'untrack .gitpublic/{replace,scan}'\n"
+            "    git rm --cached .gitpublic/replace\n"
+            "  Convert scan literals to generic regex rules, or untrack .gitpublic/scan.\n"
         )
         return 1
 
@@ -528,12 +921,28 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
         tmp_path = Path(tmp)
         work = tmp_path / "work"
 
-        source_url = expand_github_shorthand(config.source)
+        source_url = resolve_publish_source(config.source, Path(cwd))
+        target_url = expand_github_shorthand(config.target)
+
+        # Auth from env if provided. Never print the tokenized URL.
+        token = os.environ.get("GIT_PRIVATE2PUBLIC_TOKEN")
+        if token and "github.com" in target_url and target_url.startswith("https://"):
+            target_url = target_url.replace("https://", f"https://x-access-token:{token}@", 1)
+
+        # Capture the exact target state before any expensive rewriting. A later
+        # push is allowed only if the branch still has this SHA (or is still absent).
+        expected_target_refs = {
+            branch: _remote_ref_sha(target_url, f"refs/heads/{branch}")
+            for branch in config.push_branches
+        }
 
         # Backup source gitdir before any destructive rewrite
-        backup_path = _backup_gitdir(config.source, cwd)
+        backup_info = _backup_gitdir(source_url, cwd)
+        backup_path = backup_info[0] if backup_info else None
+        restore_gitdir = backup_info[1] if backup_info else None
         print(f"▸ Cloning {mask_url(source_url)} ...", file=sys.stderr)
         run(["git", "clone", "--no-local", source_url, str(work)])
+        original_source_sha = run(["git", "rev-parse", "HEAD"], cwd=str(work)).stdout.strip()
 
         # Break object-store alternates so filter-repo cannot corrupt source
         _break_alternates(work / ".git")
@@ -565,9 +974,36 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
                 sys.stderr.write(res.stderr)
                 sys.exit("git-filter-repo failed (rc=" + str(res.returncode) + ")" + bk + restore)
 
-        # Scan the result
-        print("▸ Scanning result for secrets / private data ...", file=sys.stderr)
-        violations = scan_tree(work, config)
+        try:
+            overlay_files = apply_public_overlay(overlay_path, work)
+        except OverlayError as exc:
+            print(f"✗ Public overlay rejected: {exc}", file=sys.stderr)
+            return 1
+        if overlay_files:
+            print(f"▸ Applied public overlay ({len(overlay_files)} file(s)).", file=sys.stderr)
+
+        if config.mode == "snapshot":
+            print("▸ Creating one-commit public snapshot ...", file=sys.stderr)
+            create_snapshot_root(
+                work,
+                config.snapshot_include_source_sha,
+                source_sha=original_source_sha,
+            )
+        elif overlay_files:
+            commit_public_overlay(work)
+
+        # Scan the complete result before any ref can reach the target. Built-in
+        # credential patterns are mandatory and custom rules are additive.
+        print("▸ Scanning result and all reachable refs ...", file=sys.stderr)
+        scan_config = replace(config, fail_on_match=effective_scan_rules(config.fail_on_match))
+        try:
+            violations = scan_tree(work, scan_config)
+            violations.extend(
+                scan_history(work, scan_config.fail_on_match, scan_config.allow_domains)
+            )
+        except ScanError as exc:
+            print(f"✗ Security scan incomplete: {exc}", file=sys.stderr)
+            return 1
         if violations:
             print(f"\n✗ {len(violations)} violation(s) found in final tree:", file=sys.stderr)
             for v in violations[:30]:
@@ -577,44 +1013,75 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None) -> 
             print("\nRefusing to push. Fix the rules and retry.", file=sys.stderr)
             return 1
         print("✓ No violations found.", file=sys.stderr)
+        if output_format == "json":
+            print(json.dumps({"ok": True, "scope": "sanitized-tree", "count": 0, "findings": []}, ensure_ascii=False))
 
         if scan_only:
             print("▸ Scan-only mode — not pushing.", file=sys.stderr)
             return 0
 
+        local_head = run(["git", "rev-parse", "HEAD"], cwd=str(work)).stdout.strip()
+        expected_public_refs = _local_publish_refs(work, config, local_head)
+        _verify_target_ref_names(target_url, set(expected_public_refs))
+
         # Push to target
-        target_url = expand_github_shorthand(config.target)
-
-        # Auth from env if provided. Never print the tokenized URL.
-        token = os.environ.get("GIT_PRIVATE2PUBLIC_TOKEN")
-        if token and "github.com" in target_url and target_url.startswith("https://"):
-            target_url = target_url.replace("https://", f"https://x-access-token:{token}@", 1)
-
         print(f"▸ Pushing to {mask_url(target_url)} ...", file=sys.stderr)
         run(["git", "remote", "add", "target", target_url], cwd=str(work))
 
         for branch in config.push_branches:
             push_cmd = ["git", "push"]
             if config.push_force:
-                # Note: we use plain --force (not --force-with-lease) because
-                # 'target' is a freshly-added remote with no remote-tracking
-                # ref yet, and --force-with-lease requires a ref to compare
-                # against. After clone we *know* nobody else just pushed,
-                # so plain force is fine here.
-                push_cmd.append("--force")
-            push_cmd.extend(["target", f"HEAD:{branch}"])
+                expected = expected_target_refs[branch]
+                lease = f"--force-with-lease=refs/heads/{branch}:{expected}"
+                push_cmd.append(lease)
+            push_cmd.extend(["target", f"HEAD:refs/heads/{branch}"])
             res = subprocess.run(push_cmd, cwd=str(work), capture_output=True, text=True)
             if res.returncode != 0:
                 sys.stderr.write(res.stderr)
-                sys.exit(f"push of {branch} failed (rc={res.returncode})")
+                sys.exit(
+                    f"push of {branch} failed; target probably changed while sanitizing. "
+                    "Nothing was overwritten. Run publish again."
+                )
+            _verify_remote_ref(target_url, f"refs/heads/{branch}", local_head)
 
         if config.push_tags:
+            # Never force tags: signed/release tags may drive CI and must not be
+            # silently rewritten. Existing conflicting tags make publish fail.
             res = subprocess.run(
-                ["git", "push", "--force", "target", "--tags"],
+                ["git", "push", "target", "--tags"],
                 cwd=str(work), capture_output=True, text=True
             )
             if res.returncode != 0:
                 sys.stderr.write(res.stderr)
+                sys.exit("tag push failed; existing target tags were left unchanged")
+
+        _verify_target_refs_exact(target_url, expected_public_refs)
+
+        # For small repositories, independently clone the published target and
+        # scan it again. Large repositories get cheap SHA verification above.
+        verify_limit = int(os.environ.get("GIT_PRIVATE2PUBLIC_VERIFY_MAX_BYTES", 100 * 1024 * 1024))
+        repo_size = _repo_size_bytes(work / ".git")
+        if repo_size <= verify_limit:
+            verify_repo = tmp_path / "verify-target"
+            print(f"▸ Re-cloning small target for independent verification ({repo_size // 1024 // 1024} MiB) ...", file=sys.stderr)
+            run(["git", "clone", "--no-local", target_url, str(verify_repo)])
+            verify_config = replace(config, fail_on_match=effective_scan_rules(config.fail_on_match))
+            try:
+                verify_violations = scan_tree(verify_repo, verify_config)
+                verify_violations.extend(
+                    scan_history(verify_repo, verify_config.fail_on_match, verify_config.allow_domains)
+                )
+            except ScanError as exc:
+                raise SystemExit(f"post-push target scan incomplete: {exc}") from exc
+            if verify_violations:
+                raise SystemExit("post-push target scan found violations")
+            print("✓ Published target independently re-scanned.", file=sys.stderr)
+        else:
+            print(
+                f"ℹ Target re-clone skipped ({repo_size // 1024 // 1024} MiB > "
+                f"{verify_limit // 1024 // 1024} MiB); remote SHA was verified.",
+                file=sys.stderr,
+            )
 
         if backup_path:
             msg = "✓ Done. {} updated.  | Backup: {}".format(config.target, backup_path)
@@ -657,72 +1124,99 @@ push:
 """
 
 
+HOOK_DISPATCHER_MARKER = "# git-private2public managed pre-push dispatcher"
+
+
+def _hook_paths(repo_root: Path) -> tuple[Path, Path, Path]:
+    res = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=str(repo_root), capture_output=True, text=True, check=True)
+    hook_dir = Path(res.stdout.strip())
+    if not hook_dir.is_absolute():
+        hook_dir = (repo_root / hook_dir).resolve()
+    return (
+        hook_dir / "pre-push",
+        hook_dir / "pre-push.git-private2public.json",
+        hook_dir / "pre-push.git-private2public-original",
+    )
+
+
+def _load_hook_actions(state_path: Path) -> dict[str, str]:
+    if not state_path.exists():
+        return {}
+    try:
+        value = json.loads(state_path.read_text())
+        return {str(k): str(v) for k, v in value.items()}
+    except Exception:
+        return {}
+
+
+def _write_hook_dispatcher(repo_root: Path, actions: dict[str, str]) -> None:
+    hook_path, state_path, original_path = _hook_paths(repo_root)
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+    if hook_path.exists() and HOOK_DISPATCHER_MARKER not in hook_path.read_text(errors="replace"):
+        if original_path.exists():
+            raise SystemExit(f"cannot preserve existing hook: {original_path} already exists")
+        hook_path.rename(original_path)
+
+    if not actions:
+        state_path.unlink(missing_ok=True)
+        if hook_path.exists() and HOOK_DISPATCHER_MARKER in hook_path.read_text(errors="replace"):
+            hook_path.unlink()
+        if original_path.exists():
+            original_path.rename(hook_path)
+        return
+
+    state_path.write_text(json.dumps(actions, indent=2) + "\n")
+    tool = str(Path(__file__).resolve())
+    lines = ["#!/bin/sh", HOOK_DISPATCHER_MARKER, "set -e"]
+    if "guard" in actions:
+        lines += [
+            'if [ "${GIT_PRIVATE2PUBLIC_SKIP_GUARD:-0}" != "1" ]; then',
+            f'  python3 "{tool}" guard run',
+            "fi",
+        ]
+    if "publish" in actions:
+        lines.append(f'python3 "{tool}" publish -c "{actions["publish"]}"')
+    lines += [f'if [ -x "{original_path}" ]; then', f'  exec "{original_path}" "$@"', "fi", "exit 0"]
+    hook_path.write_text("\n".join(lines) + "\n")
+    hook_path.chmod(0o755)
+
+
+def _set_hook_action(repo_root: Path, action: str, enabled: bool, config: str = "") -> dict[str, str]:
+    _, state_path, _ = _hook_paths(repo_root)
+    actions = _load_hook_actions(state_path)
+    if enabled:
+        actions[action] = config or "enabled"
+    else:
+        actions.pop(action, None)
+    _write_hook_dispatcher(repo_root, actions)
+    return actions
+
+
 def cmd_hook(args) -> int:
-    """Install / remove / show the local git pre-push hook."""
+    """Enable/disable auto-publish without overwriting existing hooks."""
     repo_root = find_git_root(Path.cwd())
     if not repo_root:
         sys.exit("Not inside a git repo.")
-
-    hook_dir = repo_root / ".git" / "hooks"
-    hook_path = hook_dir / "pre-push"
-    marker = "# git-private2public hook"
-
     if args.action == "enable":
-        hook_dir.mkdir(parents=True, exist_ok=True)
-        if hook_path.exists() and marker not in hook_path.read_text():
-            sys.exit(f"{hook_path} exists and is not managed by git-private2public; refusing to overwrite")
-        # Resolve path to this tool + config
-        tool = str(Path(__file__).resolve())
-        cfg = str(Path(args.config).resolve())
-        hook_content = f"""#!/bin/sh
-{marker}
-# Auto-generated by: {tool}
-# Runs `git-private2public publish` before `git push` goes out.
-# To disable: `git-private2public hook disable`  (or delete this file)
-exec python3 "{tool}" publish -c "{cfg}"
-"""
-        hook_path.write_text(hook_content)
-        hook_path.chmod(0o755)
-        print(f"✓ Hook installed: {hook_path}")
-        print(f"  Every `git push` will now also publish your clean public mirror.")
-        print(f"  Config: {cfg}")
-        print(f"  Disable: git-private2public hook disable")
+        actions = _set_hook_action(repo_root, "publish", True, str(Path(args.config).resolve()))
+        print(f"✓ Auto-publish enabled. Active pre-push actions: {', '.join(sorted(actions))}")
         return 0
-
     if args.action == "disable":
-        if hook_path.exists():
-            content = hook_path.read_text()
-            if marker in content:
-                hook_path.unlink()
-                print(f"✓ Hook removed: {hook_path}")
-                print(f"  `git push` will no longer auto-publish. Run `git-private2public publish` manually.")
-            else:
-                print(f"  {hook_path} exists but is not ours — leaving it alone.")
-                return 1
-        else:
-            print(f"  No hook at {hook_path} — nothing to remove.")
+        actions = _set_hook_action(repo_root, "publish", False)
+        print(f"✓ Auto-publish disabled. Active pre-push actions: {', '.join(sorted(actions)) or 'none'}")
         return 0
-
-    if args.action == "status":
-        if hook_path.exists() and marker in hook_path.read_text():
-            print(f"✓ Hook is ENABLED: {hook_path}")
-            # Show the config it points to
-            for line in hook_path.read_text().splitlines():
-                if "-c" in line:
-                    print(f"  {line.strip()}")
-        else:
-            print(f"✗ Hook is disabled (no hook at {hook_path}).")
-            print(f"  Enable: git-private2public hook enable")
-        return 0
-
-    return 1
-
+    _, state_path, original_path = _hook_paths(repo_root)
+    actions = _load_hook_actions(state_path)
+    print(f"{'✓' if 'publish' in actions else '✗'} Auto-publish is {'enabled' if 'publish' in actions else 'disabled'}.")
+    if original_path.exists():
+        print(f"  Existing pre-push hook is preserved and chained: {original_path}")
+    return 0
 
 def find_git_root(start: Path) -> Path | None:
     """Walk up from `start` to find the nearest .git directory."""
     p = start.resolve()
     while p != p.parent:
-        if (p / ".git").is_dir():
+        if (p / ".git").exists():
             return p
         p = p.parent
     return None
@@ -741,7 +1235,6 @@ GUARD_HOOK_MARKER = "# git-private2public guard hook"
 
 def scan_local_repo(repo: Path, rules: list[str], allow_domains: list[str]) -> list[str]:
     """Scan tracked files in `repo` against `rules`. Returns violations."""
-    allow_re = re.compile(b"|".join(re.escape(d.encode()) for d in allow_domains)) if allow_domains else None
     compiled: list[tuple[str, "re.Pattern[bytes]"]] = []
     for raw in rules:
         s = raw.strip()
@@ -762,24 +1255,21 @@ def scan_local_repo(repo: Path, rules: list[str], allow_domains: list[str]) -> l
             data = full.read_bytes()
         except Exception:
             continue
-        # Heuristic: skip very large binary-ish files
-        if len(data) > 1_500_000:
-            continue
         for raw, pat in compiled:
             for m in pat.finditer(data):
                 matched = m.group(0)
-                if allow_re and allow_re.search(matched):
+                if _allowed_match(matched, allow_domains):
                     continue
                 line = data[:m.start()].count(b"\n") + 1
-                snippet = matched.decode("utf-8", "replace")[:40]
-                violations.append(f"{fpath}:{line}: matches '{raw}' \u2192 {snippet!r}")
+                violations.append(format_violation(fpath, line, raw, matched))
     return violations
 
 
-# Cap on blob size for history scan; anything bigger is almost certainly a binary
-# artefact (compiled assets, dataset snapshots, etc.) and is unlikely to contain
-# a credential. Configurable via env GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES.
-DEFAULT_MAX_BLOB_BYTES = 1_500_000
+# Blobs up to this size are scanned in bounded batches. Larger blobs are blocked,
+# never silently skipped. Operators can raise the bound after assessing memory.
+DEFAULT_MAX_BLOB_BYTES = 64 * 1024 * 1024
+HISTORY_COMMAND_TIMEOUT_SECONDS = 180
+HISTORY_BATCH_BYTES = 16 * 1024 * 1024
 
 
 def _compile_rules(rules: list[str]) -> list[tuple[str, "re.Pattern[bytes]"]]:
@@ -793,125 +1283,153 @@ def _compile_rules(rules: list[str]) -> list[tuple[str, "re.Pattern[bytes]"]]:
     return compiled
 
 
-def _scan_bytes(data: bytes, fpath: str, compiled, allow_re) -> list[str]:
+def _scan_bytes(
+    data: bytes,
+    fpath: str,
+    compiled: list[tuple[str, "re.Pattern[bytes]"]],
+    allow_domains: list[str],
+) -> list[str]:
     """Apply all compiled rules to a single blob; return violations."""
     violations: list[str] = []
     for raw, pat in compiled:
         for m in pat.finditer(data):
             matched = m.group(0)
-            if allow_re and allow_re.search(matched):
+            if _allowed_match(matched, allow_domains):
                 continue
             line = data[:m.start()].count(b"\n") + 1
-            snippet = matched.decode("utf-8", "replace")[:40]
-            violations.append(f"{fpath}:{line}: matches '{raw}' \u2192 {snippet!r}")
+            violations.append(format_violation(fpath, line, raw, matched))
     return violations
 
 
-def scan_history(repo: Path, rules: list[str], allow_domains: list[str]) -> list[str]:
-    """Scan every blob reachable from any ref.
-
-    Uses ``git cat-file --batch-all-objects`` (git 2.30+) to enumerate every
-    blob in the object database and reads them in a single batch call. This
-    catches secrets that already live in old commits but were never removed
-    via filter-repo. Each blob is scanned only once even if it appears in
-    many commits (the object store already deduplicates).
-
-    Blobs larger than DEFAULT_MAX_BLOB_BYTES are skipped — they're almost
-    always binary artefacts where regex scanning would produce noise.
-    """
-    if not rules:
-        return []
-    allow_re = re.compile(b"|".join(re.escape(d.encode()) for d in allow_domains)) if allow_domains else None
-    compiled = _compile_rules(rules)
-    max_blob = int(os.environ.get("GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES", DEFAULT_MAX_BLOB_BYTES))
-
-    # 1) Enumerate every blob reachable from any object in the repo.
-    enum = subprocess.run(
-        ["git", "cat-file", "--batch-check", "--batch-all-objects",
-         "--format=%(objectname) %(objecttype) %(objectsize)"],
-        cwd=str(repo), capture_output=True, text=True,
-    )
-    if enum.returncode != 0:
-        # Older git without --batch-all-objects: fall back to rev-list.
-        rev = subprocess.run(
-            ["git", "rev-list", "--all", "--objects"],
-            cwd=str(repo), capture_output=True, text=True,
-        )
-        candidates = []
-        for line in rev.stdout.splitlines():
-            sha = line.split(maxsplit=1)[0]
-            candidates.append(sha)
-        # Probe each to filter blobs. This is slower but works everywhere.
-        blob_shas: list[str] = []
-        if candidates:
-            probe_input = "\n".join(candidates).encode() + b"\n"
-            probe = subprocess.run(
-                ["git", "cat-file", "--batch-check"],
-                cwd=str(repo), input=probe_input, capture_output=True,
-            )
-            for line in probe.stdout.decode("utf-8", "replace").splitlines():
-                parts = line.split()
-                if len(parts) >= 3 and parts[1] == "blob":
-                    try:
-                        if int(parts[2]) <= max_blob:
-                            blob_shas.append(parts[0])
-                    except ValueError:
-                        pass
-    else:
-        blob_shas = []
-        for line in enum.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[1] == "blob":
-                try:
-                    if int(parts[2]) <= max_blob:
-                        blob_shas.append(parts[0])
-                except ValueError:
-                    pass
-
-    if not blob_shas:
-        return []
-
-    # 2) Read every blob in one batch call.
-    proc = subprocess.Popen(
-        ["git", "cat-file", "--batch"],
-        cwd=str(repo), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+def _run_scan_command(command: list[str], repo: Path, *, input_data: bytes | None = None) -> subprocess.CompletedProcess:
+    """Run a Git scan command with a fail-closed timeout and error contract."""
     try:
-        stdout, _ = proc.communicate(
-            ("\n".join(blob_shas) + "\n").encode(),
-            timeout=180,
+        result = subprocess.run(
+            command,
+            cwd=str(repo),
+            input=input_data,
+            capture_output=True,
+            timeout=HISTORY_COMMAND_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return []
+    except subprocess.TimeoutExpired as exc:
+        raise ScanError("history enumeration timed out; refusing to publish") from exc
+    if result.returncode != 0:
+        raise ScanError("history enumeration failed; refusing to publish")
+    return result
 
-    # 3) Parse "<sha> <type> <size>\n<content>" records and scan each.
-    violations: list[str] = []
-    pos = 0
-    while pos < len(stdout):
-        # Header line ends at first newline.
-        nl = stdout.find(b"\n", pos)
-        if nl < 0:
-            break
-        header = stdout[pos:nl].decode("ascii", "replace")
-        parts = header.split()
-        if len(parts) < 3 or parts[1] != "blob":
-            # Skip non-blob or malformed; advance to next line.
-            pos = nl + 1
+
+def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> dict[str, tuple[str, int]]:
+    """Return reachable blob/commit/tag IDs with their types and sizes."""
+    if refs is None:
+        ref_result = _run_scan_command(
+            ["git", "for-each-ref", "--format=%(refname)"], repo
+        )
+        refs = [line for line in ref_result.stdout.decode().splitlines() if line]
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=str(repo), capture_output=True,
+                timeout=HISTORY_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ScanError("history enumeration timed out; refusing to publish") from exc
+        if head.returncode == 0 and head.stdout.strip():
+            refs.append("HEAD")
+    if not refs:
+        return {}
+
+    reachable = _run_scan_command(["git", "rev-list", "--objects", *refs], repo)
+    object_ids = sorted({line.split(maxsplit=1)[0] for line in reachable.stdout.decode().splitlines() if line})
+    if not object_ids:
+        return {}
+    probe = _run_scan_command(
+        ["git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+        repo,
+        input_data=("\n".join(object_ids) + "\n").encode(),
+    )
+    objects: dict[str, tuple[str, int]] = {}
+    for line in probe.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) != 3 or parts[1] not in {"blob", "commit", "tag"}:
             continue
         try:
-            size = int(parts[2])
-        except ValueError:
-            pos = nl + 1
-            continue
-        content_start = nl + 1
-        content_end = content_start + size
-        data = stdout[content_start:content_end]
-        # Format: <sha> <type> <size>\n<content> — no trailing newline guaranteed,
-        # but git always emits content bytes followed by next record's header.
-        for v in _scan_bytes(data, f"<history:{parts[0][:12]}>", compiled, allow_re):
-            violations.append(v)
-        pos = content_end
+            objects[parts[0]] = (parts[1], int(parts[2]))
+        except ValueError as exc:
+            raise ScanError("history object metadata was malformed; refusing to publish") from exc
+    return objects
+
+
+def _object_batches(objects: dict[str, tuple[str, int]], byte_limit: int) -> Iterable[list[str]]:
+    """Yield object ID batches with bounded expected output size."""
+    batch: list[str] = []
+    size = 0
+    for object_id, (_, object_size) in objects.items():
+        if batch and size + object_size > byte_limit:
+            yield batch
+            batch = []
+            size = 0
+        batch.append(object_id)
+        size += object_size
+    if batch:
+        yield batch
+
+
+def scan_history(
+    repo: Path,
+    rules: list[str],
+    allow_domains: list[str],
+    refs: list[str] | None = None,
+) -> list[str]:
+    """Scan every blob reachable from selected refs, failing closed on gaps."""
+    if not rules:
+        return []
+    compiled = _compile_rules(rules)
+    max_blob = int(os.environ.get("GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES", DEFAULT_MAX_BLOB_BYTES))
+    objects = _reachable_scan_objects(repo, refs)
+    violations: list[str] = []
+    safe_objects: dict[str, tuple[str, int]] = {}
+    for object_id, (object_type, size) in objects.items():
+        if size > max_blob:
+            violations.append(
+                f"<history:{object_id[:12]}>:0: oversized {object_type} ({size} bytes) "
+                f"exceeds safe scan limit ({max_blob} bytes)"
+            )
+        else:
+            safe_objects[object_id] = (object_type, size)
+
+    for batch in _object_batches(safe_objects, HISTORY_BATCH_BYTES):
+        result = _run_scan_command(
+            ["git", "cat-file", "--batch"],
+            repo,
+            input_data=("\n".join(batch) + "\n").encode(),
+        )
+        stdout = result.stdout
+        pos = 0
+        parsed: set[str] = set()
+        while pos < len(stdout):
+            nl = stdout.find(b"\n", pos)
+            if nl < 0:
+                raise ScanError("history blob stream was truncated; refusing to publish")
+            parts = stdout[pos:nl].decode("ascii", "replace").split()
+            if len(parts) != 3 or parts[1] not in {"blob", "commit", "tag"}:
+                raise ScanError("history blob stream was malformed; refusing to publish")
+            try:
+                size = int(parts[2])
+            except ValueError as exc:
+                raise ScanError("history blob size was malformed; refusing to publish") from exc
+            content_start = nl + 1
+            content_end = content_start + size
+            if content_end > len(stdout):
+                raise ScanError("history blob content was truncated; refusing to publish")
+            data = stdout[content_start:content_end]
+            violations.extend(
+                _scan_bytes(data, f"<history:{parts[0][:12]}>", compiled, allow_domains)
+            )
+            parsed.add(parts[0])
+            # cat-file terminates each batch record with one newline.
+            pos = content_end + 1
+        if parsed != set(batch):
+            raise ScanError("not every reachable blob was scanned; refusing to publish")
 
     return violations
 
@@ -936,11 +1454,20 @@ def cmd_guard_run(args) -> int:
     violations = scan_local_repo(repo, rules, allow)
     history_violations: list[str] = []
     if getattr(args, "history", True):
-        history_violations = scan_history(repo, rules, allow)
+        try:
+            history_violations = scan_history(repo, rules, allow)
+        except ScanError as exc:
+            if getattr(args, "format", "text") == "json":
+                print(json.dumps({"ok": False, "error": "history scan incomplete"}))
+            else:
+                print(f"✗ {exc}", file=sys.stderr)
+            return 1
         violations.extend(history_violations)
 
     if violations:
         n_tree = len(violations) - len(history_violations)
+        if getattr(args, "format", "text") == "json":
+            print(json.dumps({"ok": False, "count": len(violations), "working_tree": n_tree, "history": len(history_violations), "findings": violations}, ensure_ascii=False))
         n_hist = len(history_violations)
         print(f"\u2717 guard: refusing push \u2014 {len(violations)} potential secret(s):",
               file=sys.stderr)
@@ -987,83 +1514,32 @@ def cmd_guard_run(args) -> int:
         print("Skip history only (NOT recommended):  --no-history",
               file=sys.stderr)
         return 1
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"ok": True, "count": 0, "working_tree": 0, "history": 0, "findings": []}, ensure_ascii=False))
     return 0
 
 
 def cmd_guard(args) -> int:
-    """Install / remove / show the local git pre-push guard hook."""
+    """Run or manage the local pre-push guard."""
     if args.action == "run":
         return cmd_guard_run(args)
-
     repo_root = find_git_root(Path.cwd())
     if not repo_root:
         sys.exit("Not inside a git repo.")
-
-    hook_dir = repo_root / ".git" / "hooks"
-    hook_path = hook_dir / "pre-push"
-
     if args.action == "enable":
-        # If a regular `hook` (publish) is already installed, leave it alone —
-        # the user asked for guard-only. Both would race on the same hook file.
-        if hook_path.exists() and "git-private2public hook" in hook_path.read_text() \
-                and GUARD_HOOK_MARKER not in hook_path.read_text():
-            sys.exit(
-                f"{hook_path} is already a git-private2public 'hook' (publish). "
-                "Disable it first with `git-private2public hook disable` if you "
-                "want to switch to guard-only. Or run guard enable AFTER hook "
-                "disable if you want both behaviours — but they share the hook "
-                "file so you'll need to combine them manually."
-            )
-        hook_dir.mkdir(parents=True, exist_ok=True)
-        if hook_path.exists() and GUARD_HOOK_MARKER not in hook_path.read_text() \
-                and "git-private2public" not in hook_path.read_text():
-            sys.exit(f"{hook_path} exists and is not managed by git-private2public; refusing to overwrite")
-        tool = str(Path(__file__).resolve())
-        hook_content = f"""#!/bin/sh
-{GUARD_HOOK_MARKER}
-# Auto-generated by: {tool}
-# Runs `git-private2public guard run` before `git push` goes out.
-# Blocks the push if scanned content matches DEFAULT_SECRET_PATTERNS
-# (sk-, ghp_, hf_, AWS, etc.) or .gitpublic/scan rules.
-# To disable: `git-private2public guard disable`  (or delete this file)
-if [ "$GIT_PRIVATE2PUBLIC_SKIP_GUARD" = "1" ]; then
-    exit 0
-fi
-exec python3 "{tool}" guard run
-"""
-        hook_path.write_text(hook_content)
-        hook_path.chmod(0o755)
-        print(f"\u2713 Guard installed: {hook_path}")
-        print(f"  Every `git push` will now be scanned against the default")
-        print(f"  secret patterns plus your .gitpublic/scan rules.")
-        print(f"  Disable: git-private2public guard disable")
-        print(f"  Bypass once: GIT_PRIVATE2PUBLIC_SKIP_GUARD=1 git push")
+        actions = _set_hook_action(repo_root, "guard", True)
+        print(f"✓ Guard enabled. Active pre-push actions: {', '.join(sorted(actions))}")
         return 0
-
     if args.action == "disable":
-        if hook_path.exists():
-            content = hook_path.read_text()
-            if GUARD_HOOK_MARKER in content:
-                hook_path.unlink()
-                print(f"\u2713 Guard removed: {hook_path}")
-                print(f"  `git push` will no longer be auto-scanned.")
-            else:
-                print(f"  {hook_path} exists but is not ours — leaving it alone.")
-                return 1
-        else:
-            print(f"  No hook at {hook_path} — nothing to remove.")
+        actions = _set_hook_action(repo_root, "guard", False)
+        print(f"✓ Guard disabled. Active pre-push actions: {', '.join(sorted(actions)) or 'none'}")
         return 0
-
-    if args.action == "status":
-        if hook_path.exists() and GUARD_HOOK_MARKER in hook_path.read_text():
-            print(f"\u2713 Guard is ENABLED: {hook_path}")
-            print(f"  Default patterns: {len(DEFAULT_SECRET_PATTERNS)}")
-        else:
-            print(f"\u2717 Guard is disabled (no guard hook at {hook_path}).")
-            print(f"  Enable: git-private2public guard enable")
-        return 0
-
-    return 1
+    _, state_path, original_path = _hook_paths(repo_root)
+    actions = _load_hook_actions(state_path)
+    print(f"{'✓' if 'guard' in actions else '✗'} Guard is {'enabled' if 'guard' in actions else 'disabled'}.")
+    if original_path.exists():
+        print(f"  Existing pre-push hook is preserved and chained: {original_path}")
+    return 0
 
 
 # Files written by `init` into .gitpublic/
@@ -1076,6 +1552,10 @@ target = you/public-repo
 # Push settings
 push_force = true
 push_branches = main
+
+# Optional safest first public release: publish one neutral root commit only.
+# mode = snapshot
+# snapshot_include_source_sha = false
 """,
     "ignore": """# Files/dirs to NOT publish. Like .gitignore, one per line.
 .env
@@ -1102,6 +1582,103 @@ secrets/
 }
 
 
+def _doctor_check(label: str, ok: bool, detail: str) -> bool:
+    icon = "✓" if ok else "✗"
+    print(f"{icon} {label}: {detail}")
+    return ok
+
+
+def _git_remote_access(url: str) -> tuple[bool, str]:
+    if not url:
+        return False, "not configured"
+    expanded = expand_github_shorthand(url)
+    res = subprocess.run(
+        ["git", "ls-remote", expanded, "HEAD"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if res.returncode == 0:
+        return True, mask_url(expanded)
+    err = (res.stderr or res.stdout).strip().splitlines()
+    return False, (err[-1] if err else "access failed")
+
+
+def cmd_doctor(args) -> int:
+    """Diagnose installation, repository, config, hooks and remote access."""
+    cwd = Path.cwd()
+    repo = find_git_root(cwd)
+    results: list[bool] = []
+
+    git_bin = shutil.which("git")
+    results.append(_doctor_check("git", bool(git_bin), git_bin or "not found"))
+    filter_bin = shutil.which("git-filter-repo")
+    if not filter_bin:
+        user_filter = Path.home() / ".local" / "bin" / "git-filter-repo"
+        if user_filter.is_file() and os.access(user_filter, os.X_OK):
+            filter_bin = str(user_filter)
+    if not filter_bin:
+        probe = subprocess.run(["git", "filter-repo", "--version"], capture_output=True, text=True)
+        filter_bin = "git filter-repo" if probe.returncode == 0 else None
+    results.append(_doctor_check("git-filter-repo", bool(filter_bin), filter_bin or "not found; pip install git-filter-repo"))
+    results.append(_doctor_check("repository", repo is not None, str(repo) if repo else "not inside a git repository"))
+
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = cwd / config_path
+    config_ok = config_path.exists()
+    results.append(_doctor_check("config", config_ok, str(config_path)))
+
+    cfg = None
+    if config_ok:
+        try:
+            cfg = Config.load(config_path)
+            validate_config(cfg, cwd=str(repo or cwd))
+            results.append(_doctor_check("config syntax", True, "valid"))
+        except BaseException as exc:
+            results.append(_doctor_check("config syntax", False, str(exc)))
+
+    if repo:
+        tracked = check_local_gitpublic_secrets_not_tracked(str(repo))
+        results.append(_doctor_check("secret rule files", not tracked, "untracked" if not tracked else ", ".join(tracked)))
+        hook = repo / ".git" / "hooks" / "pre-push"
+        if hook.exists():
+            text = hook.read_text(errors="replace")
+            kind = "guard" if GUARD_HOOK_MARKER in text else ("publish" if "git-private2public hook" in text else "foreign")
+            results.append(_doctor_check("pre-push hook", kind != "foreign", f"enabled ({kind})"))
+        else:
+            results.append(_doctor_check("pre-push hook", False, "disabled; run `git-private2public guard enable`"))
+
+    if cfg:
+        ok, detail = _git_remote_access(cfg.source)
+        results.append(_doctor_check("source access", ok, detail))
+        ok, detail = _git_remote_access(cfg.target)
+        results.append(_doctor_check("target access", ok, detail))
+
+    failed = len([x for x in results if not x])
+    print(f"\nDoctor: {len(results)-failed}/{len(results)} checks passed.")
+    return 1 if failed else 0
+
+
+def _detect_source_remote() -> str:
+    repo = find_git_root(Path.cwd())
+    if not repo:
+        return str(Path.cwd())
+    res = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True)
+    return res.stdout.strip() if res.returncode == 0 and res.stdout.strip() else str(repo)
+
+
+def _interactive_init_values() -> tuple[str, str] | None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    detected = _detect_source_remote()
+    print("Setting up private → public publishing. Press Enter to accept a suggestion.")
+    source = input(f"Private source [{mask_url(detected)}]: ").strip() or detected
+    target = input("Public target (owner/repo, Git URL, or local path): ").strip()
+    if not target:
+        print("No public target entered. Config was created with a placeholder; edit .gitpublic/config later.")
+        target = "you/public-repo"
+    return source, target
+
+
 def cmd_init(args) -> int:
     # Folder mode: .gitpublic/ with one file per concern (like .gitignore)
     folder = Path(args.path)
@@ -1119,49 +1696,107 @@ def cmd_init(args) -> int:
     folder.mkdir(parents=True, exist_ok=True)
     for name, content in GITPUBLIC_FILES.items():
         (folder / name).write_text(content)
-    print(f"✓ Created {folder}/ with:")
-    for name in GITPUBLIC_FILES:
-        print(f"    {name}")
-    print()
-    print(f"  Edit {folder}/config  — set source + target")
-    print(f"  Edit {folder}/ignore  — files to hide (like .gitignore)")
-    print(f"  Run: git-private2public publish")
+    values = _interactive_init_values()
+    if values:
+        source, target = values
+        config_text = GITPUBLIC_FILES["config"]
+        config_text = config_text.replace("you/private-repo", source, 1).replace("you/public-repo", target, 1)
+        (folder / "config").write_text(config_text)
+    print(f"✓ Setup created in {folder}/")
+    print("Next: git-private2public publish")
+    print("Optional: edit .gitpublic/ignore like .gitignore to hide extra files.")
     return 0
 
 
+def _zero_config_scan(output_format: str = "text", history: bool = True) -> int:
+    """Scan current repository using built-in rules only; no init required."""
+    repo = find_git_root(Path.cwd())
+    if not repo:
+        sys.exit("Not inside a git repository. Open a project folder and run again.")
+    args = argparse.Namespace(history=history, format=output_format)
+    return cmd_guard_run(args)
+
+
+def _interactive_offer_guard() -> None:
+    """Offer persistent protection once, only in a real interactive terminal."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    repo = find_git_root(Path.cwd())
+    if not repo:
+        return
+    _, state_path, _ = _hook_paths(repo)
+    if "guard" in _load_hook_actions(state_path):
+        return
+    try:
+        answer = input("\nEnable automatic secret checks before every git push? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer in ("", "y", "yes"):
+        actions = _set_hook_action(repo, "guard", True)
+        print(f"✓ Guard enabled. Active pre-push actions: {', '.join(sorted(actions))}")
+    else:
+        print("Skipped. You can run `git-private2public guard enable` later.")
+
+
+def cmd_default(args) -> int:
+    """Useful zero-config behavior for a bare `git-private2public` invocation."""
+    print("git-private2public: zero-config secret scan", file=sys.stderr)
+    rc = _zero_config_scan(output_format="text", history=True)
+    if rc == 0:
+        _interactive_offer_guard()
+    return rc
+
+
 def cmd_publish(args) -> int:
+    config_path = Path(args.config)
+    if not config_path.exists():
+        sys.exit(
+            "Publishing needs one thing scanning does not: where the public copy lives.\n"
+            "Run `git-private2public init`, set source + target once, then publish.\n"
+            "Secret scanning already works without init: `git-private2public` or `git-private2public scan`."
+        )
     config = Config.load(args.config)
-    return publish(config, scan_only=args.scan, cwd=os.getcwd())
+    return publish(config, scan_only=args.scan, cwd=os.getcwd(), output_format=args.format)
 
 
 def cmd_scan(args) -> int:
+    config_path = Path(args.config)
+    if not config_path.exists():
+        return _zero_config_scan(output_format=args.format, history=True)
     config = Config.load(args.config)
-    return publish(config, scan_only=True, cwd=os.getcwd())
+    return publish(config, scan_only=True, cwd=os.getcwd(), output_format=args.format)
 
 
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="git-private2public",
-        description="Like .gitignore, but for what goes public. Folder-based config.",
+        description="Scan now, or publish a safe public copy. Run without arguments to start.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
 
-    p_init = sub.add_parser("init", help="write an example config")
+    p_init = sub.add_parser("init", help="set up private → public publishing")
     p_init.add_argument("path", nargs="?", default=".gitpublic")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
-    p_pub = sub.add_parser("publish", help="sanitize + push to target")
+    p_doctor = sub.add_parser("doctor", help="find setup or access problems")
+    p_doctor.add_argument("-c", "--config", default=".gitpublic")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_pub = sub.add_parser("publish", help="publish the cleaned public copy")
     p_pub.add_argument("-c", "--config", default=".gitpublic")
     p_pub.add_argument("--scan", action="store_true", help="scan only, don't push")
+    p_pub.add_argument("--format", choices=("text", "json"), default="text", help="report format")
     p_pub.set_defaults(func=cmd_publish)
 
-    p_scan = sub.add_parser("scan", help="scan only (no push)")
+    p_scan = sub.add_parser("scan", help="check the repository without publishing")
     p_scan.add_argument("-c", "--config", default=".gitpublic")
+    p_scan.add_argument("--format", choices=("text", "json"), default="text", help="report format")
     p_scan.set_defaults(func=cmd_scan)
 
-    p_hook = sub.add_parser("hook", help="enable/disable a local git pre-push hook")
+    p_hook = sub.add_parser("hook", help="advanced: auto-publish on git push")
     p_hook_sub = p_hook.add_subparsers(dest="action", required=True)
     p_hook_sub.add_parser("enable", help="install the pre-push hook (auto-publish on every git push)")
     p_hook_sub.add_parser("disable", help="remove the hook")
@@ -1170,7 +1805,7 @@ def main() -> int:
     p_hook.set_defaults(func=cmd_hook)
 
     p_guard = sub.add_parser(
-        "guard", help="pre-push safety net: scan for secrets, refuse push if found"
+        "guard", help="advanced: manage automatic pre-push checks"
     )
     p_guard_sub = p_guard.add_subparsers(dest="action", required=True)
     p_guard_sub.add_parser("enable", help="install the guard pre-push hook")
@@ -1192,6 +1827,8 @@ def main() -> int:
     p_guard.set_defaults(func=cmd_guard)
 
     args = p.parse_args()
+    if not getattr(args, "cmd", None):
+        return cmd_default(args)
     return args.func(args)
 
 
