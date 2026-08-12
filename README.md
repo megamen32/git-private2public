@@ -6,7 +6,8 @@
 
 ![git-private2public repository review](docs/assets/readme-hero.png)
 
-> Checked in this workspace with Python 3.10.12, pytest 8.4.2, and Git 2.34.1.
+> Repository checks recorded in this workspace: Python 3.10.12, pytest 8.4.2,
+> and Git 2.34.1.
 
 ---
 
@@ -14,8 +15,10 @@
 
 Need the full rule-by-rule explanation? Read [Advanced configuration](./docs/ADVANCED.md) / [RU](./docs/ADVANCED.ru.md).
 
-You have a private repo. You want a public one — without the secrets. This
-tool keeps them in sync. Automatically.
+You have a private repo and need a public mirror with selected files removed,
+private text rewritten, and a final scan before publication. This tool runs
+that policy-driven cleanup in a temporary clone; it does not alter the source
+repo.
 
 ## Quick start
 
@@ -45,7 +48,20 @@ Publish:
 git-private2public publish
 ```
 
-Done. Your public repo is clean.
+The publish stops when a configured scan still matches. Review the result and
+rotate any real secret separately; no sanitizer can prove that a value was
+never exposed elsewhere.
+
+## Choose your safety level
+
+| Need | Command | What it proves |
+|---|---|---|
+| Prepare a mirror | `git-private2public publish` | The configured cleanup and scan completed before push |
+| Check without pushing | `git-private2public scan` | The temporary cleaned result passes the configured scan |
+| Block risky pushes | `git-private2public guard enable` | Tracked files and Git history are checked before `git push` |
+
+The built-in guard uses known provider-token patterns plus your custom
+`.gitpublic/scan` rules. It is a refusal mechanism, not a history scrubber.
 
 ## Auto-publish on every `git push`
 
@@ -250,3 +266,9 @@ them in sync — without leaking.
 ## License
 
 MIT
+
+## Evidence and limits
+
+See [verification notes](./docs/VERIFICATION.md) for the checks behind this
+README and the claims this project deliberately does not make. Configuration
+examples and rule semantics remain in [Advanced configuration](./docs/ADVANCED.md).
