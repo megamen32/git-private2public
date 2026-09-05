@@ -92,6 +92,7 @@ class Config:
     replace: list[str] = field(default_factory=list)
     allow_domains: list[str] = field(default_factory=list)
     fail_on_match: list[str] = field(default_factory=list)
+    scan_ignore: list[str] = field(default_factory=list)
     push_force: bool = True
     push_branches: list[str] = field(default_factory=lambda: ["main"])
     push_tags: bool = False
@@ -109,6 +110,7 @@ class Config:
             replace=list(data.get("replace") or []),
             allow_domains=list(data.get("allow_domains") or data.get("allow") or data.get("domains") or []),
             fail_on_match=list(data.get("fail_on_match") or []),
+            scan_ignore=list(data.get("scan_ignore") or data.get("scan-ignore") or []),
             push_force=push.get("force", True),
             push_branches=list(push.get("branches") or ["main"]),
             push_tags=push.get("tags", False),
@@ -177,6 +179,7 @@ class Config:
             replace=read_lines("replace"),
             allow_domains=read_lines("allow") + read_lines("domains"),
             fail_on_match=read_lines("scan"),
+            scan_ignore=read_lines("scan_ignore"),
             push_force=push_force,
             push_branches=push_branches,
             push_tags=push_tags,
@@ -515,6 +518,18 @@ def _allowed_match(matched: bytes, allow_domains: list[str]) -> bool:
 # Scanning
 # --------------------------------------------------------------------------- #
 
+def _scan_ignored(fpath: str, patterns: list[str]) -> bool:
+    """Return True when a tracked path is exempt from secret scanning."""
+    posix = fpath.replace("\\", "/")
+    for raw in patterns:
+        pat = raw.strip()
+        if not pat:
+            continue
+        if fnmatch.fnmatch(posix, pat) or fnmatch.fnmatch(posix, pat.rstrip("/") + "/*"):
+            return True
+    return False
+
+
 def scan_tree(repo: Path, config: Config) -> list[str]:
     """Return list of violations (pattern + file:line) in the current tree."""
     violations: list[str] = []
@@ -534,6 +549,8 @@ def scan_tree(repo: Path, config: Config) -> list[str]:
     for fpath in files:
         full = repo / fpath
         if not full.is_file():
+            continue
+        if _scan_ignored(fpath, config.scan_ignore):
             continue
         try:
             data = full.read_bytes()
@@ -989,6 +1006,18 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
                 config.snapshot_include_source_sha,
                 source_sha=original_source_sha,
             )
+            # The snapshot intentionally destroys all other refs, but their
+            # objects stay in the clone until pruned; a fail-closed history
+            # scan would still flag them as reachable garbage.
+            run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=str(work))
+            try:
+                subprocess.run(
+                    ["git", "gc", "--prune=now", "--quiet"],
+                    cwd=str(work), check=True, capture_output=True, text=True,
+                    timeout=600,
+                )
+            except subprocess.TimeoutExpired:
+                raise ScanError("snapshot gc timed out; refusing to publish")
         elif overlay_files:
             commit_public_overlay(work)
 
@@ -999,7 +1028,7 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
         try:
             violations = scan_tree(work, scan_config)
             violations.extend(
-                scan_history(work, scan_config.fail_on_match, scan_config.allow_domains)
+                scan_history(work, scan_config.fail_on_match, scan_config.allow_domains, scan_ignore=scan_config.scan_ignore)
             )
         except ScanError as exc:
             print(f"✗ Security scan incomplete: {exc}", file=sys.stderr)
@@ -1069,7 +1098,7 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
             try:
                 verify_violations = scan_tree(verify_repo, verify_config)
                 verify_violations.extend(
-                    scan_history(verify_repo, verify_config.fail_on_match, verify_config.allow_domains)
+                    scan_history(verify_repo, verify_config.fail_on_match, verify_config.allow_domains, scan_ignore=verify_config.scan_ignore)
                 )
             except ScanError as exc:
                 raise SystemExit(f"post-push target scan incomplete: {exc}") from exc
@@ -1318,8 +1347,8 @@ def _run_scan_command(command: list[str], repo: Path, *, input_data: bytes | Non
     return result
 
 
-def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> dict[str, tuple[str, int]]:
-    """Return reachable blob/commit/tag IDs with their types and sizes."""
+def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> tuple[dict[str, tuple[str, int]], dict[str, str]]:
+    """Return reachable blob/commit/tag IDs with types/sizes plus blob paths."""
     if refs is None:
         ref_result = _run_scan_command(
             ["git", "for-each-ref", "--format=%(refname)"], repo
@@ -1336,10 +1365,19 @@ def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> dict[str, tup
         if head.returncode == 0 and head.stdout.strip():
             refs.append("HEAD")
     if not refs:
-        return {}
+        return {}, {}
 
     reachable = _run_scan_command(["git", "rev-list", "--objects", *refs], repo)
-    object_ids = sorted({line.split(maxsplit=1)[0] for line in reachable.stdout.decode().splitlines() if line})
+    blob_paths: dict[str, str] = {}
+    object_ids: set[str] = set()
+    for line in reachable.stdout.decode().splitlines():
+        if not line:
+            continue
+        object_id, _, path = line.partition(" ")
+        object_ids.add(object_id)
+        if path:
+            blob_paths[object_id] = path
+    object_ids = sorted(object_ids)
     if not object_ids:
         return {}
     probe = _run_scan_command(
@@ -1356,7 +1394,7 @@ def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> dict[str, tup
             objects[parts[0]] = (parts[1], int(parts[2]))
         except ValueError as exc:
             raise ScanError("history object metadata was malformed; refusing to publish") from exc
-    return objects
+    return objects, blob_paths
 
 
 def _object_batches(objects: dict[str, tuple[str, int]], byte_limit: int) -> Iterable[list[str]]:
@@ -1379,16 +1417,20 @@ def scan_history(
     rules: list[str],
     allow_domains: list[str],
     refs: list[str] | None = None,
+    scan_ignore: list[str] | None = None,
 ) -> list[str]:
     """Scan every blob reachable from selected refs, failing closed on gaps."""
     if not rules:
         return []
     compiled = _compile_rules(rules)
     max_blob = int(os.environ.get("GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES", DEFAULT_MAX_BLOB_BYTES))
-    objects = _reachable_scan_objects(repo, refs)
+    objects, blob_paths = _reachable_scan_objects(repo, refs)
+    scan_ignore = scan_ignore or []
     violations: list[str] = []
     safe_objects: dict[str, tuple[str, int]] = {}
     for object_id, (object_type, size) in objects.items():
+        if object_type == "blob" and object_id in blob_paths and _scan_ignored(blob_paths[object_id], scan_ignore):
+            continue
         if size > max_blob:
             violations.append(
                 f"<history:{object_id[:12]}>:0: oversized {object_type} ({size} bytes) "
