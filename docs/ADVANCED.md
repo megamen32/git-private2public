@@ -38,11 +38,19 @@ target = you/public-repo
 push_force = true
 push_branches = main
 push_tags = false
+preserve_target_tags = true
 ```
 
-For a first public release, `snapshot` mode publishes only the sanitized
-current tracked tree as one neutral root commit. It removes private commit
-messages, authors, branches, tags, and previous history before filtering:
+For a public snapshot, `snapshot` mode publishes the sanitized current tracked
+tree as one neutral root commit. It removes private commit messages, authors,
+branches, tags, and previous history before filtering. Set
+`preserve_target_tags = true` to keep tags already on the public target at their
+exact existing object IDs; private source tags are still never published. Other
+unconfigured refs remain a hard error, and the publisher verifies every retained
+tag after updating the configured branches. Existing tags are not sent in the
+push. A concurrent remote ref change after preflight is detected by the final
+check and can be reported after the branch update. Reconcile the target before
+retrying:
 
 ```ini
 mode = snapshot
@@ -50,7 +58,8 @@ snapshot_include_source_sha = false
 ```
 
 Set `snapshot_include_source_sha = true` only when intentionally exposing the
-private source commit ID. Snapshot mode rejects `push_tags = true`. Normal
+private source commit ID. Snapshot mode rejects `push_tags = true`; the source
+tag publisher and existing-target-tag preservation cannot be combined. Normal
 `history` mode remains the default.
 
 `source` and `target` can be:

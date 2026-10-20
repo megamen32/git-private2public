@@ -11,7 +11,10 @@ import git_private2public as g
 def test_folder_config_loads_allow_and_domains_alias(tmp_path: Path):
     cfgdir = tmp_path / ".gitpublic"
     cfgdir.mkdir()
-    (cfgdir / "config").write_text("source = owner/private\ntarget = owner/public\npush_force = false\npush_branches = main,dev\n")
+    (cfgdir / "config").write_text(
+        "source = owner/private\ntarget = owner/public\npush_force = false\n"
+        "push_branches = main,dev\npreserve_target_tags = true\n"
+    )
     (cfgdir / "ignore").write_text("# comment\n.env\n*.key\n")
     (cfgdir / "allow").write_text("github.com\n")
     (cfgdir / "domains").write_text("example.com\n")
@@ -24,6 +27,7 @@ def test_folder_config_loads_allow_and_domains_alias(tmp_path: Path):
     assert cfg.allow_domains == ["github.com", "example.com"]
     assert cfg.push_force is False
     assert cfg.push_branches == ["main", "dev"]
+    assert cfg.preserve_target_tags is True
 
 
 def test_folder_config_loads_snapshot_mode(tmp_path: Path):
@@ -53,6 +57,32 @@ def test_yaml_config_accepts_allow_alias(tmp_path: Path):
 
     assert cfg.delete == [".env"]
     assert cfg.allow_domains == ["github.com"]
+
+
+def test_yaml_config_loads_preserve_target_tags(tmp_path: Path):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        "source: owner/private\n"
+        "target: owner/public\n"
+        "mode: snapshot\n"
+        "push:\n"
+        "  preserve_target_tags: true\n"
+    )
+
+    assert g.Config.load(path).preserve_target_tags is True
+
+
+def test_yaml_config_rejects_string_preserve_target_tags(tmp_path: Path):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        "source: owner/private\n"
+        "target: owner/public\n"
+        "push:\n"
+        '  preserve_target_tags: "false"\n'
+    )
+
+    with pytest.raises(SystemExit, match="preserve_target_tags must be a boolean"):
+        g.validate_config(g.Config.load(path))
 
 
 def test_delete_rules_map_to_filter_repo_args(tmp_path: Path):
@@ -115,8 +145,8 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.2.2"
-    assert 'version = "0.2.2"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    assert g.__version__ == "0.2.3"
+    assert 'version = "0.2.3"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -478,6 +508,18 @@ def test_remote_ref_sha_timeout_fails_closed_without_url_leak(monkeypatch):
     assert "super-secret-token" not in message
 
 
+def test_target_push_error_redacts_url_credentials_and_token():
+    token = "private-publish-token"
+    url = f"https://x-access-token:{token}@github.com/owner/public.git"
+    raw = f"fatal: repository '{url}' unavailable\nremote rejected {token}\n"
+
+    safe = g.redact_target_output(raw, url, token)
+
+    assert url not in safe
+    assert token not in safe
+    assert "https://***@github.com/owner/public.git" in safe
+
+
 @pytest.mark.parametrize(
     "unexpected_ref",
     ["refs/heads/stale", "refs/tags/stale", "refs/notes/private"],
@@ -498,6 +540,78 @@ def test_target_ref_allowlist_accepts_configured_head_and_tags(monkeypatch):
 
     g._verify_target_ref_names("target", set(expected))
     g._verify_target_refs_exact("target", expected)
+
+
+def test_target_ref_allowlist_can_preserve_existing_target_tags(monkeypatch):
+    remote = {
+        "refs/heads/main": "a" * 40,
+        "refs/tags/node-v1024": "b" * 40,
+        "refs/tags/v1021": "c" * 40,
+    }
+    monkeypatch.setattr(g, "_remote_refs", lambda url: dict(remote))
+
+    preserved = g._verify_target_ref_names(
+        "target", {"refs/heads/main"}, preserve_target_tags=True
+    )
+
+    assert preserved == {
+        "refs/tags/node-v1024": "b" * 40,
+        "refs/tags/v1021": "c" * 40,
+    }
+
+
+def test_preserve_target_tags_does_not_allow_unconfigured_branches(monkeypatch):
+    monkeypatch.setattr(
+        g,
+        "_remote_refs",
+        lambda url: {"refs/heads/stale": "a" * 40, "refs/tags/v1": "b" * 40},
+    )
+
+    with pytest.raises(SystemExit, match="unexpected target refs"):
+        g._verify_target_ref_names(
+            "target", {"refs/heads/main"}, preserve_target_tags=True
+        )
+
+
+def test_preserved_target_tag_change_fails_post_publish_verification(monkeypatch):
+    expected = {
+        "refs/heads/main": "a" * 40,
+        "refs/tags/v1": "b" * 40,
+    }
+    monkeypatch.setattr(
+        g,
+        "_remote_refs",
+        lambda url: {"refs/heads/main": "a" * 40, "refs/tags/v1": "c" * 40},
+    )
+
+    with pytest.raises(SystemExit, match="post-push target refs differ.*changed=refs/tags/v1"):
+        g._verify_target_refs_exact("target", expected)
+
+
+@pytest.mark.parametrize(
+    "actual",
+    [
+        {"refs/tags/v1": "c" * 40},
+        {"refs/tags/v1": "b" * 40, "refs/tags/v2": "d" * 40},
+        {},
+    ],
+    ids=["changed", "added", "removed"],
+)
+def test_target_tag_snapshot_change_aborts_before_publication(actual):
+    with pytest.raises(SystemExit, match="public target tags changed during sanitization"):
+        g._verify_target_tags_unchanged({"refs/tags/v1": "b" * 40}, actual)
+
+
+def test_preserve_target_tags_cannot_be_combined_with_pushing_source_tags():
+    cfg = g.Config(
+        source="owner/private",
+        target="owner/public",
+        push_tags=True,
+        preserve_target_tags=True,
+    )
+
+    with pytest.raises(SystemExit, match="push_tags and preserve_target_tags"):
+        g.validate_config(cfg)
 
 
 def test_post_push_ref_verification_blocks_missing_or_changed_refs(monkeypatch):
@@ -822,6 +936,164 @@ def test_snapshot_publish_creates_single_public_root_without_tags(tmp_path: Path
     assert refs == ["refs/heads/main"]
     assert "Private Person" not in log
     assert "private current" not in log
+
+
+def test_snapshot_publish_preserves_existing_public_release_tags(tmp_path: Path):
+    source = tmp_path / "private"
+    seed = tmp_path / "seed"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    seed.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(seed)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+
+    for repo, name, email in (
+        (source, "Private Person", "private@example.test"),
+        (seed, "Public Release Bot", "public@example.test"),
+    ):
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", name], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", email], check=True)
+
+    (seed / "public.txt").write_text("previous release\n")
+    subprocess.run(["git", "-C", str(seed), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "previous public snapshot"], check=True)
+    subprocess.run(["git", "-C", str(seed), "tag", "node-v1024"], check=True)
+    subprocess.run(["git", "-C", str(seed), "tag", "-a", "v1021", "-m", "release v1021"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", str(target), "main", "--tags"], check=True)
+    before_tags = subprocess.run(
+        ["git", "--git-dir", str(target), "for-each-ref", "--format=%(objectname) %(refname)", "refs/tags/"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+
+    (source / "public.txt").write_text("current sanitized source\n")
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Private Person"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "private@example.test"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "private current source"], check=True)
+    subprocess.run(["git", "-C", str(source), "tag", "private-only-tag"], check=True)
+
+    cfg = g.Config(
+        source=str(source), target=str(target), mode="snapshot",
+        push_force=True, preserve_target_tags=True,
+    )
+    assert g.publish(cfg, cwd=str(source)) == 0
+
+    after_tags = subprocess.run(
+        ["git", "--git-dir", str(target), "for-each-ref", "--format=%(objectname) %(refname)", "refs/tags/"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    target_refs = subprocess.run(
+        ["git", "--git-dir", str(target), "for-each-ref", "--format=%(refname)"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    public_log = subprocess.run(
+        ["git", "--git-dir", str(target), "log", "--format=%an%n%s", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+    assert after_tags == before_tags
+    assert "refs/tags/private-only-tag" not in target_refs
+    assert target_refs == ["refs/heads/main", "refs/tags/node-v1024", "refs/tags/v1021"]
+    assert "Private Person" not in public_log
+    assert "private current source" not in public_log
+    assert subprocess.run(
+        ["git", "--git-dir", str(target), "rev-list", "--count", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip() == "1"
+
+
+def test_snapshot_publish_aborts_before_branch_push_if_target_tag_changes(tmp_path: Path, monkeypatch):
+    source = tmp_path / "private"
+    seed = tmp_path / "seed"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    seed.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(seed)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    for repo in (source, seed):
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.test"], check=True)
+    (seed / "public.txt").write_text("first\n")
+    subprocess.run(["git", "-C", str(seed), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "first"], check=True)
+    first = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(seed), "tag", "v1"], check=True)
+    (seed / "public.txt").write_text("second\n")
+    subprocess.run(["git", "-C", str(seed), "commit", "-qam", "second"], check=True)
+    second = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(seed), "push", "-q", str(target), "main", "--tags"], check=True)
+    original_main = subprocess.run(["git", "--git-dir", str(target), "rev-parse", "refs/heads/main"], capture_output=True, text=True, check=True).stdout.strip()
+    (source / "public.txt").write_text("sanitized current\n")
+    subprocess.run(["git", "-C", str(source), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "private current"], check=True)
+
+    verify = g._verify_target_ref_names
+    changed = False
+
+    def change_target_tag(url, allowed_refs, *, preserve_target_tags=False):
+        nonlocal changed
+        if not changed:
+            subprocess.run(
+                ["git", "--git-dir", str(target), "update-ref", "refs/tags/v1", second],
+                check=True,
+            )
+            changed = True
+        return verify(url, allowed_refs, preserve_target_tags=preserve_target_tags)
+
+    monkeypatch.setattr(g, "_verify_target_ref_names", change_target_tag)
+    cfg = g.Config(source=str(source), target=str(target), mode="snapshot", push_force=True, preserve_target_tags=True)
+
+    with pytest.raises(SystemExit, match="public target tags changed during sanitization"):
+        g.publish(cfg, cwd=str(source))
+
+    assert subprocess.run(["git", "--git-dir", str(target), "rev-parse", "refs/heads/main"], capture_output=True, text=True, check=True).stdout.strip() == original_main
+    assert subprocess.run(["git", "--git-dir", str(target), "rev-parse", "refs/tags/v1"], capture_output=True, text=True, check=True).stdout.strip() == second
+    assert first != second
+
+
+def test_target_tag_change_after_preflight_is_reported_after_branch_push(tmp_path: Path):
+    source = tmp_path / "private"
+    seed = tmp_path / "seed"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    seed.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(seed)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    for repo in (source, seed):
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.test"], check=True)
+    (seed / "public.txt").write_text("first\n")
+    subprocess.run(["git", "-C", str(seed), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "first"], check=True)
+    first = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(seed), "tag", "v1"], check=True)
+    (seed / "public.txt").write_text("second\n")
+    subprocess.run(["git", "-C", str(seed), "commit", "-qam", "second"], check=True)
+    second = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(seed), "push", "-q", str(target), "main", "--tags"], check=True)
+    original_main = subprocess.run(["git", "--git-dir", str(target), "rev-parse", "refs/heads/main"], capture_output=True, text=True, check=True).stdout.strip()
+    (source / "public.txt").write_text("sanitized current\n")
+    subprocess.run(["git", "-C", str(source), "add", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "private current"], check=True)
+
+    hook = target / "hooks" / "pre-receive"
+    hook.write_text(
+        f'#!/bin/sh\nunset GIT_QUARANTINE_PATH\n'
+        f'git --git-dir="$GIT_DIR" update-ref refs/tags/v1 {second}\n'
+    )
+    hook.chmod(0o755)
+    cfg = g.Config(source=str(source), target=str(target), mode="snapshot", push_force=True, preserve_target_tags=True)
+
+    with pytest.raises(SystemExit, match="post-push target refs differ.*changed=refs/tags/v1"):
+        g.publish(cfg, cwd=str(source))
+
+    published_main = subprocess.run(["git", "--git-dir", str(target), "rev-parse", "refs/heads/main"], capture_output=True, text=True, check=True).stdout.strip()
+    assert published_main != original_main
+    assert subprocess.run(["git", "--git-dir", str(target), "rev-parse", "refs/tags/v1"], capture_output=True, text=True, check=True).stdout.strip() == second
+    assert first != second
 
 
 def test_publish_blocks_stale_target_ref_before_writing_configured_head(tmp_path: Path):

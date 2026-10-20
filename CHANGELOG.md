@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- Preserve existing public target tags unchanged during snapshot publication when explicitly enabled.
+- Continue rejecting unconfigured refs and verify preserved tag object IDs after the branch push.
+
 ## 0.2.2
 
 - Fail closed with a concise redacted error when target-ref preflight times out.

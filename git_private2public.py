@@ -35,7 +35,7 @@ from pathlib import Path
 import time
 from typing import Iterable
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 try:
     import yaml
@@ -95,6 +95,7 @@ class Config:
     push_force: bool = True
     push_branches: list[str] = field(default_factory=lambda: ["main"])
     push_tags: bool = False
+    preserve_target_tags: bool = False
     mode: str = "history"
     snapshot_include_source_sha: bool = False
 
@@ -112,6 +113,7 @@ class Config:
             push_force=push.get("force", True),
             push_branches=list(push.get("branches") or ["main"]),
             push_tags=push.get("tags", False),
+            preserve_target_tags=push.get("preserve_target_tags", data.get("preserve_target_tags", False)),
             mode=str(data.get("mode") or "history"),
             snapshot_include_source_sha=bool(data.get("snapshot_include_source_sha", False)),
         )
@@ -121,7 +123,7 @@ class Config:
         """Load from a .gitpublic/ folder — each file is one concern, gitignore-style.
 
         Files (all optional — if missing, that setting is empty):
-          config      — source=, target=, push_force=, push_branches= (key=value)
+          config      — source=, target=, push_force=, push_branches=, preserve_target_tags= (key=value)
           ignore      — one path/glob per line (# for comments)
           replace     — old==>new per line (regex: prefix supported, glob:*.ext: scoped)
           scan        — one regex/literal per line (fail_on_match)
@@ -145,6 +147,7 @@ class Config:
         push_force = True
         push_branches = ["main"]
         push_tags = False
+        preserve_target_tags = False
         mode = "history"
         snapshot_include_source_sha = False
         cfg_file = folder / "config"
@@ -165,6 +168,10 @@ class Config:
                     push_branches = [b.strip() for b in v.split(",") if b.strip()]
                 elif k == "push_tags":
                     push_tags = v.lower() in ("true", "yes", "1")
+                elif k == "preserve_target_tags":
+                    if v.lower() not in ("true", "false", "yes", "no", "1", "0"):
+                        raise SystemExit("preserve_target_tags must be true or false")
+                    preserve_target_tags = v.lower() in ("true", "yes", "1")
                 elif k == "mode":
                     mode = v
                 elif k == "snapshot_include_source_sha":
@@ -180,6 +187,7 @@ class Config:
             push_force=push_force,
             push_branches=push_branches,
             push_tags=push_tags,
+            preserve_target_tags=preserve_target_tags,
             mode=mode,
             snapshot_include_source_sha=snapshot_include_source_sha,
         )
@@ -296,6 +304,12 @@ def mask_url(url: str) -> str:
     return re.sub(r"https://[^/@]+@", "https://***@", url)
 
 
+def redact_target_output(output: str, target_url: str, token: str | None = None) -> str:
+    """Remove URL credentials and explicit publisher tokens from Git diagnostics."""
+    safe = output.replace(target_url, mask_url(target_url))
+    return safe.replace(token, "***") if token else safe
+
+
 def validate_config(config: Config, cwd: str | None = None) -> None:
     """Validate config and apply single-repo fallback.
 
@@ -333,8 +347,12 @@ def validate_config(config: Config, cwd: str | None = None) -> None:
         raise SystemExit(f"missing required config value(s): {', '.join(missing)}")
     if config.mode not in {"history", "snapshot"}:
         raise SystemExit("mode must be 'history' or 'snapshot'")
+    if type(config.preserve_target_tags) is not bool:
+        raise SystemExit("preserve_target_tags must be a boolean")
     if config.mode == "snapshot" and config.push_tags:
         raise SystemExit("snapshot mode cannot publish tags")
+    if config.push_tags and config.preserve_target_tags:
+        raise SystemExit("push_tags and preserve_target_tags cannot be enabled together")
 
 
 def clone_source(source: str, dest: Path) -> None:
@@ -776,13 +794,35 @@ def _remote_refs(url: str) -> dict[str, str]:
     return refs
 
 
-def _verify_target_ref_names(url: str, allowed_refs: set[str]) -> None:
-    """Block publication when the target retains any unconfigured ref."""
-    unexpected = sorted(set(_remote_refs(url)) - allowed_refs)
+def _verify_target_ref_names(
+    url: str,
+    allowed_refs: set[str],
+    *,
+    preserve_target_tags: bool = False,
+) -> dict[str, str]:
+    """Block unconfigured refs and return existing tags explicitly preserved by policy."""
+    target_refs = _remote_refs(url)
+    preserved_tags = {
+        ref: sha for ref, sha in target_refs.items()
+        if preserve_target_tags and ref.startswith("refs/tags/")
+    }
+    unexpected = sorted(set(target_refs) - allowed_refs - set(preserved_tags))
     if unexpected:
         preview = ", ".join(unexpected[:10])
         suffix = f" and {len(unexpected) - 10} more" if len(unexpected) > 10 else ""
         raise SystemExit(f"unexpected target refs block publication: {preview}{suffix}")
+    return preserved_tags
+
+
+def _verify_target_tags_unchanged(
+    expected: dict[str, str],
+    actual: dict[str, str],
+) -> None:
+    """Fail before publishing if an existing public tag changed during sanitization."""
+    if actual != expected:
+        raise SystemExit(
+            "public target tags changed during sanitization; nothing was pushed"
+        )
 
 
 def _verify_target_refs_exact(url: str, expected_refs: dict[str, str]) -> None:
@@ -931,9 +971,14 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
 
         # Capture the exact target state before any expensive rewriting. A later
         # push is allowed only if the branch still has this SHA (or is still absent).
+        initial_target_refs = _remote_refs(target_url)
         expected_target_refs = {
-            branch: _remote_ref_sha(target_url, f"refs/heads/{branch}")
+            branch: initial_target_refs.get(f"refs/heads/{branch}", "")
             for branch in config.push_branches
+        }
+        expected_target_tags = {
+            ref: sha for ref, sha in initial_target_refs.items()
+            if config.preserve_target_tags and ref.startswith("refs/tags/")
         }
 
         # Backup source gitdir before any destructive rewrite
@@ -1022,12 +1067,23 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
 
         local_head = run(["git", "rev-parse", "HEAD"], cwd=str(work)).stdout.strip()
         expected_public_refs = _local_publish_refs(work, config, local_head)
-        _verify_target_ref_names(target_url, set(expected_public_refs))
+        preserved_target_tags = _verify_target_ref_names(
+            target_url,
+            set(expected_public_refs),
+            preserve_target_tags=config.preserve_target_tags,
+        )
+        _verify_target_tags_unchanged(expected_target_tags, preserved_target_tags)
+        expected_public_refs.update(preserved_target_tags)
 
         # Push to target
         print(f"▸ Pushing to {mask_url(target_url)} ...", file=sys.stderr)
         run(["git", "remote", "add", "target", target_url], cwd=str(work))
 
+        if config.preserve_target_tags:
+            print(
+                f"▸ Publishing configured branches; leaving {len(preserved_target_tags)} existing public tag(s) untouched ...",
+                file=sys.stderr,
+            )
         for branch in config.push_branches:
             push_cmd = ["git", "push"]
             if config.push_force:
@@ -1037,7 +1093,7 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
             push_cmd.extend(["target", f"HEAD:refs/heads/{branch}"])
             res = subprocess.run(push_cmd, cwd=str(work), capture_output=True, text=True)
             if res.returncode != 0:
-                sys.stderr.write(res.stderr)
+                sys.stderr.write(redact_target_output(res.stderr, target_url, token))
                 sys.exit(
                     f"push of {branch} failed; target probably changed while sanitizing. "
                     "Nothing was overwritten. Run publish again."
@@ -1052,7 +1108,7 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
                 cwd=str(work), capture_output=True, text=True
             )
             if res.returncode != 0:
-                sys.stderr.write(res.stderr)
+                sys.stderr.write(redact_target_output(res.stderr, target_url, token))
                 sys.exit("tag push failed; existing target tags were left unchanged")
 
         _verify_target_refs_exact(target_url, expected_public_refs)

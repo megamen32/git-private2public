@@ -23,3 +23,5 @@ ignore:          # these won't be in the public repo
 push:
   force: true
   branches: [main]
+  # Keep existing public release tags unchanged; private source tags are not pushed.
+  preserve_target_tags: false
