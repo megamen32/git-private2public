@@ -4,6 +4,8 @@
 
 - Preserve existing public target tags unchanged during snapshot publication when explicitly enabled.
 - Continue rejecting unconfigured refs and verify preserved tag object IDs after the branch push.
+- Add current-tree scan path exemptions and prune unreachable pre-snapshot objects before the history scan.
+- Keep history scanning complete because one blob can be reachable through both exempt and non-exempt paths.
 
 ## 0.2.2
 

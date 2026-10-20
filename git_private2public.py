@@ -84,6 +84,14 @@ DEFAULT_SECRET_PATTERNS: list[str] = [
 # Config
 # --------------------------------------------------------------------------- #
 
+def _yaml_bool(value: object, name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if type(value) is not bool:
+        raise SystemExit(f"{name} must be a YAML boolean")
+    return value
+
+
 @dataclass
 class Config:
     source: str
@@ -103,7 +111,18 @@ class Config:
     @classmethod
     def from_yaml(cls, path: Path) -> "Config":
         data = yaml.safe_load(path.read_text())
+        if not isinstance(data, dict):
+            raise SystemExit("YAML config must be a mapping")
         push = data.get("push") or {}
+        if not isinstance(push, dict):
+            raise SystemExit("push must be a mapping")
+        branches = push.get("branches")
+        if branches is None or branches == []:
+            branches = ["main"]
+        elif isinstance(branches, str):
+            branches = [branches]
+        elif not isinstance(branches, list):
+            raise SystemExit("push.branches must be a branch name or list of branch names")
         return cls(
             source=data["source"],
             target=data["target"],
@@ -112,12 +131,18 @@ class Config:
             allow_domains=list(data.get("allow_domains") or data.get("allow") or data.get("domains") or []),
             fail_on_match=list(data.get("fail_on_match") or []),
             scan_ignore=list(data.get("scan_ignore") or data.get("scan-ignore") or []),
-            push_force=push.get("force", True),
-            push_branches=list(push.get("branches") or ["main"]),
-            push_tags=push.get("tags", False),
-            preserve_target_tags=push.get("preserve_target_tags", data.get("preserve_target_tags", False)),
+            push_force=_yaml_bool(push.get("force"), "push.force", True),
+            push_branches=branches,
+            push_tags=_yaml_bool(push.get("tags"), "push.tags", False),
+            preserve_target_tags=_yaml_bool(
+                push.get("preserve_target_tags", data.get("preserve_target_tags")),
+                "push.preserve_target_tags",
+                False,
+            ),
             mode=str(data.get("mode") or "history"),
-            snapshot_include_source_sha=bool(data.get("snapshot_include_source_sha", False)),
+            snapshot_include_source_sha=_yaml_bool(
+                data.get("snapshot_include_source_sha"), "snapshot_include_source_sha", False
+            ),
         )
 
     @classmethod
@@ -304,13 +329,15 @@ def expand_github_shorthand(value: str) -> str:
 
 
 def mask_url(url: str) -> str:
-    return re.sub(r"https://[^/@]+@", "https://***@", url)
+    return re.sub(r"(?i)(https?|ssh)://[^/\s@]+@", r"\1://***@", url)
 
 
 def redact_target_output(output: str, target_url: str, token: str | None = None) -> str:
     """Remove URL credentials and explicit publisher tokens from Git diagnostics."""
     safe = output.replace(target_url, mask_url(target_url))
-    return safe.replace(token, "***") if token else safe
+    if token:
+        safe = safe.replace(token, "***")
+    return re.sub(r"(?i)(https?|ssh)://[^/\s@]+@", r"\1://***@", safe)
 
 
 def validate_config(config: Config, cwd: str | None = None) -> None:
@@ -350,8 +377,17 @@ def validate_config(config: Config, cwd: str | None = None) -> None:
         raise SystemExit(f"missing required config value(s): {', '.join(missing)}")
     if config.mode not in {"history", "snapshot"}:
         raise SystemExit("mode must be 'history' or 'snapshot'")
-    if type(config.preserve_target_tags) is not bool:
-        raise SystemExit("preserve_target_tags must be a boolean")
+    for name, value in (
+        ("push_force", config.push_force),
+        ("push_tags", config.push_tags),
+        ("preserve_target_tags", config.preserve_target_tags),
+        ("snapshot_include_source_sha", config.snapshot_include_source_sha),
+    ):
+        if type(value) is not bool:
+            raise SystemExit(f"{name} must be a boolean")
+    if (not isinstance(config.push_branches, list)
+            or any(not isinstance(branch, str) or not branch for branch in config.push_branches)):
+        raise SystemExit("push_branches must be a list of non-empty branch names")
     if config.mode == "snapshot" and config.push_tags:
         raise SystemExit("snapshot mode cannot publish tags")
     if config.push_tags and config.preserve_target_tags:
@@ -1403,8 +1439,8 @@ def _run_scan_command(command: list[str], repo: Path, *, input_data: bytes | Non
     return result
 
 
-def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> tuple[dict[str, tuple[str, int]], dict[str, str]]:
-    """Return reachable blob/commit/tag IDs with types/sizes plus blob paths."""
+def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> dict[str, tuple[str, int]]:
+    """Return reachable blob/commit/tag IDs with their types and sizes."""
     if refs is None:
         ref_result = _run_scan_command(
             ["git", "for-each-ref", "--format=%(refname)"], repo
@@ -1421,18 +1457,15 @@ def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> tuple[dict[st
         if head.returncode == 0 and head.stdout.strip():
             refs.append("HEAD")
     if not refs:
-        return {}, {}
+        return {}
 
     reachable = _run_scan_command(["git", "rev-list", "--objects", *refs], repo)
-    blob_paths: dict[str, str] = {}
     object_ids: set[str] = set()
     for line in reachable.stdout.decode().splitlines():
         if not line:
             continue
-        object_id, _, path = line.partition(" ")
+        object_id = line.split(maxsplit=1)[0]
         object_ids.add(object_id)
-        if path:
-            blob_paths[object_id] = path
     object_ids = sorted(object_ids)
     if not object_ids:
         return {}
@@ -1450,7 +1483,7 @@ def _reachable_scan_objects(repo: Path, refs: list[str] | None) -> tuple[dict[st
             objects[parts[0]] = (parts[1], int(parts[2]))
         except ValueError as exc:
             raise ScanError("history object metadata was malformed; refusing to publish") from exc
-    return objects, blob_paths
+    return objects
 
 
 def _object_batches(objects: dict[str, tuple[str, int]], byte_limit: int) -> Iterable[list[str]]:
@@ -1475,18 +1508,21 @@ def scan_history(
     refs: list[str] | None = None,
     scan_ignore: list[str] | None = None,
 ) -> list[str]:
-    """Scan every blob reachable from selected refs, failing closed on gaps."""
+    """Scan every blob reachable from selected refs, failing closed on gaps.
+
+    ``scan_ignore`` is accepted for API compatibility but never exempts history
+    objects: one blob can be reachable through both ignored and non-ignored
+    paths, while ``rev-list --objects`` reports only one display path per blob.
+    Path exemptions apply to the current tree scan only.
+    """
     if not rules:
         return []
     compiled = _compile_rules(rules)
     max_blob = int(os.environ.get("GIT_PRIVATE2PUBLIC_MAX_BLOB_BYTES", DEFAULT_MAX_BLOB_BYTES))
-    objects, blob_paths = _reachable_scan_objects(repo, refs)
-    scan_ignore = scan_ignore or []
+    objects = _reachable_scan_objects(repo, refs)
     violations: list[str] = []
     safe_objects: dict[str, tuple[str, int]] = {}
     for object_id, (object_type, size) in objects.items():
-        if object_type == "blob" and object_id in blob_paths and _scan_ignored(blob_paths[object_id], scan_ignore):
-            continue
         if size > max_blob:
             violations.append(
                 f"<history:{object_id[:12]}>:0: oversized {object_type} ({size} bytes) "

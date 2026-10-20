@@ -24,9 +24,15 @@ Missing custom files mean “no custom rules for that step”. Built-in credenti
 | `.gitpublic/ignore` | Removes matching files/paths from all published history | No files are removed |
 | `.gitpublic/replace` | Rewrites matching text in remaining files | No text is rewritten |
 | `.gitpublic/scan` | Adds custom blocking patterns | Built-in credential rules still protect zero-config scans and guard mode |
+| `.gitpublic/scan_ignore` | Skips matching paths in the current sanitized tree scan | Every current-tree file is scanned |
 | `.gitpublic/allow` | Exceptions for domain-like matches found by `scan` | No scan exceptions exist |
 | `.gitpublic/domains` | Same as `allow` alias | Nothing is allowlisted |
 | `.gitpublic/public/` | Adds or replaces files in the sanitized public tree | No public-only overlay is applied |
+
+`scan_ignore` does not exempt history blobs. Git can share one blob across
+multiple paths, so a displayed history path cannot safely identify every use
+of that content. Snapshot mode prunes unreachable private history before the
+history scan; history mode still checks all reachable content.
 
 ## `.gitpublic/config`
 

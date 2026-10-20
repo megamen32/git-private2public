@@ -44,6 +44,15 @@ def test_folder_config_loads_snapshot_mode(tmp_path: Path):
     assert cfg.snapshot_include_source_sha is True
 
 
+def test_folder_config_loads_scan_ignore(tmp_path: Path):
+    cfgdir = tmp_path / ".gitpublic"
+    cfgdir.mkdir()
+    (cfgdir / "config").write_text("source = owner/private\ntarget = owner/public\n")
+    (cfgdir / "scan_ignore").write_text("# fixture globs\ntests/fixtures/**\n*.snapshot\n")
+
+    assert g.Config.load(cfgdir).scan_ignore == ["tests/fixtures/**", "*.snapshot"]
+
+
 def test_yaml_config_accepts_allow_alias(tmp_path: Path):
     path = tmp_path / "rules.yaml"
     path.write_text(
@@ -59,6 +68,17 @@ def test_yaml_config_accepts_allow_alias(tmp_path: Path):
     assert cfg.allow_domains == ["github.com"]
 
 
+def test_yaml_config_loads_scan_ignore(tmp_path: Path):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        "source: owner/private\n"
+        "target: owner/public\n"
+        "scan_ignore: ['tests/fixtures/**']\n"
+    )
+
+    assert g.Config.load(path).scan_ignore == ["tests/fixtures/**"]
+
+
 def test_yaml_config_loads_preserve_target_tags(tmp_path: Path):
     path = tmp_path / "rules.yaml"
     path.write_text(
@@ -72,17 +92,37 @@ def test_yaml_config_loads_preserve_target_tags(tmp_path: Path):
     assert g.Config.load(path).preserve_target_tags is True
 
 
-def test_yaml_config_rejects_string_preserve_target_tags(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("option", "expected_error"),
+    [
+        ('push:\n  preserve_target_tags: "false"\n', "push.preserve_target_tags"),
+        ('push:\n  force: "false"\n', "push.force"),
+        ('push:\n  tags: "false"\n', "push.tags"),
+        ('snapshot_include_source_sha: "false"\n', "snapshot_include_source_sha"),
+    ],
+)
+def test_yaml_config_rejects_quoted_boolean_options(tmp_path: Path, option: str, expected_error: str):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        "source: owner/private\n"
+        "target: owner/public\n"
+        + option
+    )
+
+    with pytest.raises(SystemExit, match=f"{expected_error} must be a YAML boolean"):
+        g.Config.load(path)
+
+
+def test_yaml_config_treats_scalar_branch_as_one_branch_name(tmp_path: Path):
     path = tmp_path / "rules.yaml"
     path.write_text(
         "source: owner/private\n"
         "target: owner/public\n"
         "push:\n"
-        '  preserve_target_tags: "false"\n'
+        "  branches: main\n"
     )
 
-    with pytest.raises(SystemExit, match="preserve_target_tags must be a boolean"):
-        g.validate_config(g.Config.load(path))
+    assert g.Config.load(path).push_branches == ["main"]
 
 
 def test_delete_rules_map_to_filter_repo_args(tmp_path: Path):
@@ -508,16 +548,31 @@ def test_remote_ref_sha_timeout_fails_closed_without_url_leak(monkeypatch):
     assert "super-secret-token" not in message
 
 
-def test_target_push_error_redacts_url_credentials_and_token():
-    token = "private-publish-token"
-    url = f"https://x-access-token:{token}@github.com/owner/public.git"
-    raw = f"fatal: repository '{url}' unavailable\nremote rejected {token}\n"
+@pytest.mark.parametrize(
+    ("url", "diagnostic", "secret"),
+    [
+        (
+            "https://x-access-token:private-publish-token@github.com/owner/public.git",
+            "fatal: repository 'https://x-access-token:private-publish-token@github.com/owner/public.git/' unavailable",
+            "private-publish-token",
+        ),
+        (
+            "http://mirror-user:mirror-password@mirror.example/private.git/",
+            "fatal: repository 'http://mirror-user:mirror-password@mirror.example/private.git' unavailable",
+            "mirror-password",
+        ),
+        (
+            "ssh://mirror-user:mirror-password@mirror.example/private.git",
+            "fatal: repository 'ssh://mirror-user:mirror-password@mirror.example/private.git' unavailable",
+            "mirror-password",
+        ),
+    ],
+)
+def test_target_push_error_redacts_url_credentials_and_token(url: str, diagnostic: str, secret: str):
+    safe = g.redact_target_output(diagnostic, url, secret)
 
-    safe = g.redact_target_output(raw, url, token)
-
-    assert url not in safe
-    assert token not in safe
-    assert "https://***@github.com/owner/public.git" in safe
+    assert secret not in safe
+    assert "***@" in safe
 
 
 @pytest.mark.parametrize(
@@ -637,6 +692,50 @@ def test_remote_refs_ignores_symbolic_head_and_peeled_tag(monkeypatch):
     )
 
     assert g._remote_refs("target") == {"refs/tags/v1": tag}
+
+
+def test_reachable_scan_objects_returns_empty_mapping_for_unborn_repository(tmp_path: Path):
+    repo = tmp_path / "unborn"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+    assert g._reachable_scan_objects(repo, None) == {}
+
+
+def test_history_scan_never_uses_scan_ignore_to_skip_an_aliased_blob(tmp_path: Path):
+    repo = tmp_path / "private"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.test"], check=True)
+    fake_token = "ghp_" + "A" * 36
+    (repo / "ignored").mkdir()
+    (repo / "ignored" / "fixture.txt").write_text(fake_token + "\n")
+    (repo / "public.txt").write_text(fake_token + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "ignored/fixture.txt", "public.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "fixture alias"], check=True)
+
+    violations = g.scan_history(
+        repo, g.DEFAULT_SECRET_PATTERNS, [], scan_ignore=["ignored/**"]
+    )
+
+    assert violations
+    assert any("<history:" in finding for finding in violations)
+
+
+def test_current_tree_scan_ignore_skips_matching_fixture_path(tmp_path: Path):
+    repo = tmp_path / "tree"
+    (repo / "tests" / "fixtures").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    fake_token = "ghp_" + "C" * 36
+    (repo / "tests" / "fixtures" / "sample.txt").write_text(fake_token + "\n")
+    subprocess.run(["git", "-C", str(repo), "add", "tests/fixtures/sample.txt"], check=True)
+    cfg = g.Config(
+        source="owner/private", target="owner/public",
+        fail_on_match=g.DEFAULT_SECRET_PATTERNS,
+        scan_ignore=["tests/fixtures/**"],
+    )
+
+    assert g.scan_tree(repo, cfg) == []
 
 
 def test_hook_dispatcher_preserves_foreign_hook_and_combines_actions(tmp_path: Path, monkeypatch):
@@ -936,6 +1035,33 @@ def test_snapshot_publish_creates_single_public_root_without_tags(tmp_path: Path
     assert refs == ["refs/heads/main"]
     assert "Private Person" not in log
     assert "private current" not in log
+
+
+def test_snapshot_prunes_secret_in_removed_private_history_before_scan(tmp_path: Path):
+    source = tmp_path / "private"
+    target = tmp_path / "public.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(target)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Private Person"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "private@example.test"], check=True)
+    fake_token = "ghp_" + "B" * 36
+    (source / "old.txt").write_text(fake_token + "\n")
+    subprocess.run(["git", "-C", str(source), "add", "old.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "private old"], check=True)
+    subprocess.run(["git", "-C", str(source), "rm", "-q", "old.txt"], check=True)
+    (source / "safe.txt").write_text("public content\n")
+    subprocess.run(["git", "-C", str(source), "add", "safe.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "current public source"], check=True)
+    cfg = g.Config(source=str(source), target=str(target), mode="snapshot", push_force=True)
+
+    assert g.publish(cfg, cwd=str(source)) == 0
+
+    public_files = subprocess.run(
+        ["git", "--git-dir", str(target), "ls-tree", "-r", "--name-only", "refs/heads/main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert public_files == ["safe.txt"]
 
 
 def test_snapshot_publish_preserves_existing_public_release_tags(tmp_path: Path):
