@@ -35,7 +35,7 @@ from pathlib import Path
 import time
 from typing import Iterable
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 try:
     import yaml
@@ -898,6 +898,35 @@ def _verify_target_refs_exact(url: str, expected_refs: dict[str, str]) -> None:
         raise SystemExit(f"post-push target refs differ: {'; '.join(details)}")
 
 
+def _target_tag_scan_refs(repo: Path, tags: dict[str, str]) -> list[str]:
+    """Fetch preserved tags into an isolated namespace and return exact refs."""
+    if not tags:
+        return []
+    run(
+        ["git", "fetch", "--quiet", "--no-tags", "target", "+refs/tags/*:refs/target-tags/*"],
+        cwd=str(repo),
+    )
+    lines = run(
+        ["git", "for-each-ref", "--format=%(objectname) %(refname)", "refs/target-tags/"],
+        cwd=str(repo),
+    ).stdout.splitlines()
+    actual = {}
+    refs = []
+    for line in lines:
+        object_id, ref_name = line.split(maxsplit=1)
+        remote_ref = "refs/tags/" + ref_name.removeprefix("refs/target-tags/")
+        actual[remote_ref] = object_id
+        refs.append(ref_name)
+    if actual != tags:
+        raise SystemExit("public target tags changed while their baseline was scanned")
+    return sorted(refs)
+
+
+def _new_violations(current: list[str], preserved_baseline: list[str]) -> list[str]:
+    """Find new findings while retaining unchanged historical public tags."""
+    return sorted(set(current) - set(preserved_baseline))
+
+
 def _local_publish_refs(work: Path, config: Config, head: str) -> dict[str, str]:
     """Build the exact remote ref set that a successful publish must expose."""
     expected = {f"refs/heads/{branch}": head for branch in config.push_branches}
@@ -1138,11 +1167,34 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
             preserve_target_tags=config.preserve_target_tags,
         )
         _verify_target_tags_unchanged(expected_target_tags, preserved_target_tags)
+        run(["git", "remote", "add", "target", target_url], cwd=str(work))
+        tag_refs = _target_tag_scan_refs(work, preserved_target_tags)
+        try:
+            preserved_tag_findings = scan_history(
+                work,
+                effective_scan_rules(config.fail_on_match),
+                config.allow_domains,
+                refs=tag_refs,
+                scan_ignore=config.scan_ignore,
+            )
+        except ScanError as exc:
+            raise SystemExit(f"preserved public tag scan incomplete: {exc}") from exc
+        if preserved_tag_findings:
+            print(
+                f"ℹ Preserving {len(preserved_target_tags)} existing public tag(s) with "
+                f"{len(preserved_tag_findings)} pre-existing scan finding(s); checking that "
+                "the publication adds none.",
+                file=sys.stderr,
+            )
+        latest_target_tags = {
+            ref: sha for ref, sha in _remote_refs(target_url).items()
+            if ref.startswith("refs/tags/")
+        }
+        _verify_target_tags_unchanged(expected_target_tags, latest_target_tags)
         expected_public_refs.update(preserved_target_tags)
 
         # Push to target
         print(f"▸ Pushing to {mask_url(target_url)} ...", file=sys.stderr)
-        run(["git", "remote", "add", "target", target_url], cwd=str(work))
 
         if config.preserve_target_tags:
             print(
@@ -1194,8 +1246,23 @@ def publish(config: Config, scan_only: bool = False, cwd: str | None = None, out
                 )
             except ScanError as exc:
                 raise SystemExit(f"post-push target scan incomplete: {exc}") from exc
-            if verify_violations:
-                raise SystemExit("post-push target scan found violations")
+            new_findings = _new_violations(verify_violations, preserved_tag_findings)
+            if new_findings:
+                print(
+                    f"✗ Post-push scan found {len(new_findings)} new violation(s):",
+                    file=sys.stderr,
+                )
+                for finding in new_findings[:30]:
+                    print(f"  {finding}", file=sys.stderr)
+                if len(new_findings) > 30:
+                    print(f"  ... and {len(new_findings) - 30} more", file=sys.stderr)
+                raise SystemExit("post-push target scan found new violations")
+            if preserved_tag_findings:
+                print(
+                    f"✓ Published tree adds no findings; {len(preserved_tag_findings)} "
+                    "pre-existing finding(s) remain only through unchanged public history.",
+                    file=sys.stderr,
+                )
             print("✓ Published target independently re-scanned.", file=sys.stderr)
         else:
             print(

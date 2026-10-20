@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Scan preserved public release tags before publishing and retain only their redacted pre-existing findings.
+- Independently reject any new scan findings after publication while keeping unchanged tag refs intact.
+
 ## 0.2.3
 
 - Preserve existing public target tags unchanged during snapshot publication when explicitly enabled.

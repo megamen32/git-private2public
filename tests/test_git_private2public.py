@@ -185,8 +185,8 @@ def test_replace_rule_strips_separator_whitespace():
 
 
 def test_version_constant_matches_package_version():
-    assert g.__version__ == "0.2.3"
-    assert 'version = "0.2.3"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    assert g.__version__ == "0.2.4"
+    assert 'version = "0.2.4"' in (Path(__file__).parent.parent / "pyproject.toml").read_text()
 
 
 def test_gitpublic_secret_check_finds_only_replace_and_scan(tmp_path: Path):
@@ -1064,7 +1064,7 @@ def test_snapshot_prunes_secret_in_removed_private_history_before_scan(tmp_path:
     assert public_files == ["safe.txt"]
 
 
-def test_snapshot_publish_preserves_existing_public_release_tags(tmp_path: Path):
+def test_snapshot_publish_preserves_existing_public_release_tags_and_finds_no_new_leaks(tmp_path: Path, capfd):
     source = tmp_path / "private"
     seed = tmp_path / "seed"
     target = tmp_path / "public.git"
@@ -1081,7 +1081,9 @@ def test_snapshot_publish_preserves_existing_public_release_tags(tmp_path: Path)
         subprocess.run(["git", "-C", str(repo), "config", "user.name", name], check=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.email", email], check=True)
 
-    (seed / "public.txt").write_text("previous release\n")
+    # A previously published dummy credential-shaped fixture remains reachable
+    # only through immutable release tags. Its source and value stay redacted.
+    (seed / "public.txt").write_text("previous release " + "sk-" + "x" * 20 + "\n")
     subprocess.run(["git", "-C", str(seed), "add", "public.txt"], check=True)
     subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "previous public snapshot"], check=True)
     subprocess.run(["git", "-C", str(seed), "tag", "node-v1024"], check=True)
@@ -1104,6 +1106,9 @@ def test_snapshot_publish_preserves_existing_public_release_tags(tmp_path: Path)
         push_force=True, preserve_target_tags=True,
     )
     assert g.publish(cfg, cwd=str(source)) == 0
+    publish_output = capfd.readouterr().err
+    assert "pre-existing scan finding(s)" in publish_output
+    assert "publication adds none" in publish_output
 
     after_tags = subprocess.run(
         ["git", "--git-dir", str(target), "for-each-ref", "--format=%(objectname) %(refname)", "refs/tags/"],
